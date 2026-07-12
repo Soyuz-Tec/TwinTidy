@@ -1,11 +1,16 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestScanFindsExactMatchesWithDifferentNames(t *testing.T) {
@@ -158,31 +163,199 @@ func TestScanFilesHonorsCategoryFilter(t *testing.T) {
 	}
 }
 
-func TestDeleteFilesFallsBackToPermanentDelete(t *testing.T) {
+func TestScanFilesRefreshesMetadataBeforeGrouping(t *testing.T) {
 	root := userFileTestRoot(t)
-	path := filepath.Join(root, "remove-me.txt")
-	writeTestFile(t, path, []byte("delete"))
+	want := []byte("current duplicate payload")
+	left := filepath.Join(root, "left.txt")
+	right := filepath.Join(root, "right.txt")
+	writeTestFile(t, left, want)
+	writeTestFile(t, right, []byte("old"))
 
-	originalTrashThrow := trashThrow
-	trashThrow = func(...string) error {
-		return errors.New("trash unavailable")
+	engine := NewEngine(2)
+	report, err := engine.SurfaceScan(context.Background(), []string{root}, make(chan Progress, 128))
+	if err != nil {
+		t.Fatalf("SurfaceScan returned error: %v", err)
 	}
-	defer func() {
-		trashThrow = originalTrashThrow
-	}()
+	writeTestFile(t, right, want)
 
-	result := DeleteFiles([]string{path}, true)
-	if len(result.Failed) != 0 {
-		t.Fatalf("expected no failures, got %#v", result.Failed)
+	groups, err := engine.ScanFiles(context.Background(), report.Files, DefaultScanOptions(), make(chan Progress, 128))
+	if err != nil {
+		t.Fatalf("ScanFiles returned error: %v", err)
 	}
-	if len(result.Deleted) != 1 {
-		t.Fatalf("expected one deleted file, got %#v", result.Deleted)
+	if len(groups) != 1 || len(groups[0].Files) != 2 {
+		t.Fatalf("expected refreshed metadata to reveal one duplicate group, got %#v", groups)
 	}
-	if result.Deleted[0].Action != DeleteActionPermanent {
-		t.Fatalf("expected permanent fallback, got %s", result.Deleted[0].Action)
+	for _, file := range groups[0].Files {
+		if file.Size != int64(len(want)) {
+			t.Fatalf("expected refreshed size %d for %s, got %d", len(want), file.Path, file.Size)
+		}
+		if file.Identity == (FileIdentity{}) {
+			t.Fatalf("expected stable identity for %s", file.Path)
+		}
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected file to be removed, stat err=%v", err)
+}
+
+func TestSurfaceScanBindsEveryRecordToAuthorizedRoot(t *testing.T) {
+	root := userFileTestRoot(t)
+	writeTestFile(t, filepath.Join(root, "bound.txt"), []byte("scope-bound record"))
+
+	report, err := NewEngine(1).SurfaceScan(context.Background(), []string{root}, nil)
+	if err != nil {
+		t.Fatalf("SurfaceScan returned error: %v", err)
+	}
+	if len(report.Files) != 1 {
+		t.Fatalf("expected one record, got %#v", report.Files)
+	}
+	record := report.Files[0]
+	if record.Scope.RootFinalPath == "" || record.Scope.RootIdentity == (FileIdentity{}) || record.Scope.RootIsFile {
+		t.Fatalf("record has invalid directory scope: %#v", record.Scope)
+	}
+	if !pathWithinScope(record.Path, record.Scope) {
+		t.Fatalf("record %q is outside scope %#v", record.Path, record.Scope)
+	}
+	if err := ValidateRecordScope(record); err != nil {
+		t.Fatalf("ValidateRecordScope rejected unchanged record: %v", err)
+	}
+	file, err := OpenVerifiedRecordForRead(record)
+	if err != nil {
+		t.Fatalf("OpenVerifiedRecordForRead rejected unchanged record: %v", err)
+	}
+	content, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read verified record: read=%v close=%v", readErr, closeErr)
+	}
+	if string(content) != "scope-bound record" {
+		t.Fatalf("verified read returned %q", content)
+	}
+
+	// AuthorizedScope must remain comparable so request validation can bind the
+	// exact same value without pointer identity or mutable state.
+	seen := map[AuthorizedScope]bool{record.Scope: true}
+	if !seen[record.Scope] {
+		t.Fatal("authorized scope is not stable as a comparable map key")
+	}
+}
+
+func TestScanFilesRejectsUnscopedInventory(t *testing.T) {
+	_, err := NewEngine(1).ScanFiles(context.Background(), []FileRecord{{
+		Path:     filepath.Join(userFileTestRoot(t), "unscoped.txt"),
+		Category: CategoryText,
+	}}, DefaultScanOptions(), nil)
+	if !errors.Is(err, errMissingScope) {
+		t.Fatalf("ScanFiles error = %v, want errMissingScope", err)
+	}
+}
+
+func TestPathWithinScopeUsesComponentBoundary(t *testing.T) {
+	parent := userFileTestRoot(t)
+	root := filepath.Join(parent, "selected")
+	scope := AuthorizedScope{RootFinalPath: root, RootIdentity: FileIdentity{VolumeSerial: 1}}
+	if !pathWithinScope(filepath.Join(root, "child", "file.txt"), scope) {
+		t.Fatal("child path was rejected")
+	}
+	if pathWithinScope(filepath.Join(parent, "selected-other", "file.txt"), scope) {
+		t.Fatal("sibling path sharing the root string prefix was accepted")
+	}
+	if pathWithinScope(parent, scope) {
+		t.Fatal("parent path was accepted")
+	}
+
+	scope.RootIsFile = true
+	if !pathWithinScope(root, scope) || pathWithinScope(filepath.Join(root, "child"), scope) {
+		t.Fatal("single-file scope did not require the exact final path")
+	}
+}
+
+func TestSurfaceScanStopsAtActionableFileLimit(t *testing.T) {
+	root := userFileTestRoot(t)
+	writeTestFile(t, filepath.Join(root, "a.txt"), []byte("a"))
+	writeTestFile(t, filepath.Join(root, "b.txt"), []byte("b"))
+	writeTestFile(t, filepath.Join(root, "c.txt"), []byte("c"))
+
+	engine := NewEngineWithLimits(2, ScanLimits{MaxRoots: 1, MaxDirectories: 10, MaxFiles: 2})
+	_, err := engine.SurfaceScan(context.Background(), []string{root}, nil)
+	if !errors.Is(err, ErrScanLimitExceeded) {
+		t.Fatalf("SurfaceScan error = %v, want ErrScanLimitExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "maximum of 2 file") || !strings.Contains(err.Error(), "select fewer or smaller folders") {
+		t.Fatalf("scan limit error is not actionable: %v", err)
+	}
+}
+
+func TestSurfaceScanStopsAtActionableDirectoryLimit(t *testing.T) {
+	root := userFileTestRoot(t)
+	if err := os.MkdirAll(filepath.Join(root, "child"), 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	engine := NewEngineWithLimits(1, ScanLimits{MaxRoots: 1, MaxDirectories: 1, MaxFiles: 10})
+	_, err := engine.SurfaceScan(context.Background(), []string{root}, nil)
+	if !errors.Is(err, ErrScanLimitExceeded) {
+		t.Fatalf("SurfaceScan error = %v, want ErrScanLimitExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "maximum of 1 directory") {
+		t.Fatalf("directory limit error is not actionable: %v", err)
+	}
+}
+
+func TestDirectoryEnumerationChecksCancellationWithinBatch(t *testing.T) {
+	root := userFileTestRoot(t)
+	for index := 0; index < directoryReadBatchSize+10; index++ {
+		writeTestFile(t, filepath.Join(root, fmt.Sprintf("file-%04d.txt", index)), []byte("x"))
+	}
+	scope, info, err := authorizeScanRoot(root)
+	if err != nil {
+		t.Fatalf("authorizeScanRoot failed: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("test root is not a directory")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	work := directoryWork{path: scope.RootFinalPath, scope: scope}
+	queue := newDirectoryQueue([]directoryWork{work})
+	budget := scanBudget{limits: ScanLimits{MaxRoots: 1, MaxDirectories: 10, MaxFiles: 1_000}}
+	var directories, ignored, skipped int64
+	visited := 0
+	err = NewEngine(1).readDirectory(
+		ctx,
+		work,
+		queue,
+		&budget,
+		func(string, AuthorizedScope) error {
+			visited++
+			cancel()
+			return nil
+		},
+		&directories,
+		&ignored,
+		&skipped,
+		nil,
+		time.Now(),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("readDirectory error = %v, want context.Canceled", err)
+	}
+	if visited != 1 {
+		t.Fatalf("enumeration visited %d files after cancellation, want 1", visited)
+	}
+}
+
+func TestCopyWithContextStopsBetweenReads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &cancelAfterFirstReader{cancel: cancel}
+	var destination bytes.Buffer
+
+	written, err := copyWithContext(ctx, &destination, reader, make([]byte, 32))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copyWithContext error = %v, want context.Canceled", err)
+	}
+	if written == 0 {
+		t.Fatal("expected the first read to complete before cancellation")
+	}
+	if reader.reads != 1 {
+		t.Fatalf("reader performed %d reads after cancellation, want 1", reader.reads)
 	}
 }
 
@@ -218,4 +391,19 @@ func repeatByte(b byte, count int) []byte {
 		data[i] = b
 	}
 	return data
+}
+
+type cancelAfterFirstReader struct {
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (r *cancelAfterFirstReader) Read(buffer []byte) (int, error) {
+	if r.reads > 0 {
+		return 0, io.EOF
+	}
+	r.reads++
+	count := copy(buffer, []byte("first chunk"))
+	r.cancel()
+	return count, nil
 }

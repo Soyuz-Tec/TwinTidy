@@ -1,0 +1,12 @@
+# Default ownership
+* @Soyuz-Tec
+
+# Safety, architecture, release, and platform boundaries
+/internal/scanner/** @Soyuz-Tec
+/internal/gui/** @Soyuz-Tec
+/cmd/twintidy/** @Soyuz-Tec
+/docs/** @Soyuz-Tec
+/.github/** @Soyuz-Tec
+/go.mod @Soyuz-Tec
+/go.sum @Soyuz-Tec
+/AGENTS.md @Soyuz-Tec

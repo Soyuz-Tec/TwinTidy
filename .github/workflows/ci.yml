@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: "0"
+      GOFLAGS: -mod=readonly
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify deterministic Windows resources
+        shell: pwsh
+        run: .\scripts\generate-resources.ps1 -Check
+
+      - name: Verify third-party notices
+        shell: pwsh
+        run: .\scripts\generate-notices.ps1 -Check
+
+      - name: Test release source and artifact binding
+        shell: pwsh
+        run: .\scripts\test-release-hardening.ps1
+
+      - name: Check formatting
+        shell: pwsh
+        run: |
+          $files = @(git ls-files "*.go")
+          $unformatted = @(& gofmt -l $files)
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($unformatted.Count -gt 0) {
+            $unformatted | ForEach-Object { Write-Error "Unformatted Go file: $_" }
+            exit 1
+          }
+
+      - name: Verify module files
+        shell: pwsh
+        run: |
+          go mod verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tidyDiff = @(go mod tidy -diff 2>&1)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($tidyDiff.Count -gt 0) {
+            $tidyDiff | ForEach-Object { Write-Host $_ }
+            throw "go.mod or go.sum is not tidy."
+          }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1 -coverprofile=coverage.out
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+  windows-build:
+    name: Windows ${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            runner: windows-2025
+          - goarch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      CGO_ENABLED: "0"
+      GOOS: windows
+      GOARCH: ${{ matrix.goarch }}
+      GOFLAGS: -mod=readonly
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Require matching Windows resource
+        shell: pwsh
+        run: |
+          $resource = "cmd/twintidy/rsrc_windows_${env:GOARCH}.syso"
+          if (-not (Test-Path -LiteralPath $resource)) {
+            throw "Missing required resource object: $resource"
+          }
+
+      - name: Test natively
+        run: go test ./... -count=1
+
+      - name: Build release-mode executable
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          $version = "0.0.0-ci.1"
+          $sourceDate = (git show -s --format=%cI HEAD).Trim()
+          $outRoot = Join-Path $env:RUNNER_TEMP "twintidy-build"
+          $buildResults = @(.\scripts\build.ps1 `
+            -Version $version `
+            -Commit $env:SOURCE_COMMIT `
+            -SourceDate $sourceDate `
+            -Architecture $env:GOARCH `
+            -OutputDirectory $outRoot `
+            -SkipResourceCheck `
+            -SourceMode GitCommit)
+          $build = @($buildResults | Where-Object { $_.Architecture -eq $env:GOARCH })
+          if ($build.Count -ne 1) { throw "Build produced no unique receipt for ${env:GOARCH}." }
+          $out = Join-Path (Join-Path $outRoot "TwinTidy-$version-windows-${env:GOARCH}") "TwinTidy.exe"
+          if (-not (Test-Path -LiteralPath $out)) { throw "Build produced no executable." }
+          if (-not (Test-Path -LiteralPath $build[0].ReceiptPath)) { throw "Build produced no receipt." }
+          $actualHash = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLowerInvariant()
+          $actualReceiptHash = (Get-FileHash -LiteralPath $build[0].ReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $build[0].SHA256 -or $actualReceiptHash -ne $build[0].ReceiptSHA256) {
+            throw "Build outputs do not match their returned digest binding."
+          }
+          $actualVersion = (& $out --version 2>&1 | Out-String).Trim()
+          $expectedVersion = "TwinTidy $version (commit $env:SOURCE_COMMIT, source date $sourceDate)"
+          if ($actualVersion -ne $expectedVersion) {
+            throw "Runtime version '$actualVersion' does not equal '$expectedVersion'."
+          }
+          $smoke = Start-Process `
+            -FilePath $out `
+            -ArgumentList @("--ui-smoke-test") `
+            -Wait `
+            -PassThru `
+            -WindowStyle Hidden
+          if ($smoke.ExitCode -ne 0) {
+            throw "Native UI smoke test failed with exit code $($smoke.ExitCode)."
+          }

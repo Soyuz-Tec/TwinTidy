@@ -9,18 +9,18 @@ import (
 	"html"
 	"image/png"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"duplicate-file-finder-go/internal/diagnostics"
-	"duplicate-file-finder-go/internal/scanner"
+	"github.com/Soyuz-Tec/duplicate-file-finder-go/internal/buildinfo"
+	"github.com/Soyuz-Tec/duplicate-file-finder-go/internal/diagnostics"
+	"github.com/Soyuz-Tec/duplicate-file-finder-go/internal/scanner"
 
-	pdf "github.com/ledongthuc/pdf"
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
 	"github.com/lxn/win"
@@ -61,18 +61,18 @@ func macSectionFont() Font {
 type windowsApp struct {
 	mw *walk.MainWindow
 
-	selectFolderButton *walk.PushButton
-	scanButton         *walk.PushButton
-	cancelButton       *walk.PushButton
-	clearButton        *walk.PushButton
-	resetButton        *walk.PushButton
-	logButton          *walk.PushButton
-	keepNewestButton   *walk.PushButton
-	keepOldestButton   *walk.PushButton
-	clearSelectButton  *walk.PushButton
-	openButton         *walk.PushButton
-	richPreviewButton  *walk.PushButton
-	deleteButton       *walk.PushButton
+	selectFolderButton  *walk.PushButton
+	scanButton          *walk.PushButton
+	cancelButton        *walk.PushButton
+	clearButton         *walk.PushButton
+	resetButton         *walk.PushButton
+	logButton           *walk.PushButton
+	keepNewestButton    *walk.PushButton
+	keepOldestButton    *walk.PushButton
+	clearSelectButton   *walk.PushButton
+	openButton          *walk.PushButton
+	previewSafetyButton *walk.PushButton
+	deleteButton        *walk.PushButton
 
 	folderLabel  *walk.Label
 	stageLabel   *walk.Label
@@ -102,11 +102,15 @@ type windowsApp struct {
 	model               *duplicateTableModel
 	currentPreviewImage walk.Image
 
-	selectedFolder string
-	surfaceReady   bool
-	surfaceReport  scanner.SurfaceReport
-	scanCancel     context.CancelFunc
-	scanStartedAt  time.Time
+	operation     operationState
+	surfaceReport scanner.SurfaceReport
+
+	previewState      previewGenerationState
+	previewWorker     *previewWorker
+	previewCancel     context.CancelFunc
+	currentPreviewDir string
+	allowedPreviewURL string
+	uiClosing         atomic.Bool
 }
 
 type duplicateRow struct {
@@ -126,27 +130,73 @@ type duplicateTableModel struct {
 	onSelectionChanged func()
 }
 
-func Run() {
+func Run() error {
 	diagnostics.Logf("gui initializing")
 	ui := &windowsApp{
-		engine: scanner.NewEngine(0),
-		model:  &duplicateTableModel{},
+		engine:    scanner.NewEngine(0),
+		model:     &duplicateTableModel{},
+		operation: newOperationState(),
 	}
 	ui.model.onSelectionChanged = ui.updateDeleteActionState
 	if err := ui.create(); err != nil {
-		diagnostics.Logf("gui create failed: %v", err)
-		fmt.Fprintln(os.Stderr, err)
-		return
+		diagnostics.Logf("gui create failed: error_type=%T", err)
+		return fmt.Errorf("create TwinTidy window: %w", err)
 	}
+	ui.startPreviewWorker()
+	defer ui.stopPreviewWorker()
+	ui.mw.Closing().Attach(ui.handleWindowClosing)
 	ui.setInitialState()
 	diagnostics.Logf("gui ready")
 	ui.mw.Run()
+	return nil
+}
+
+func SmokeTest() error {
+	ui := &windowsApp{
+		engine:    scanner.NewEngine(1),
+		model:     &duplicateTableModel{},
+		operation: newOperationState(),
+	}
+	if err := ui.create(); err != nil {
+		return fmt.Errorf("create TwinTidy smoke-test window: %w", err)
+	}
+	ui.mw.Dispose()
+	return nil
+}
+
+func (a *windowsApp) synchronizeUI(callback func()) {
+	if a.uiClosing.Load() {
+		return
+	}
+	a.mw.Synchronize(func() {
+		if a.uiClosing.Load() {
+			return
+		}
+		callback()
+	})
+}
+
+func (a *windowsApp) handleWindowClosing(canceled *bool, _ walk.CloseReason) {
+	disposition := a.operation.requestClose()
+	a.stopPreviewWorker()
+	if disposition == closeDeferred {
+		*canceled = true
+		_ = a.statusLabel.SetText("Finishing the active Recycle Bin operation before closing TwinTidy.")
+		a.renderFromPhase()
+		generation := uint64(0)
+		if a.operation.active != nil {
+			generation = a.operation.active.generation
+		}
+		diagnostics.Logf("window close deferred: generation=%d", generation)
+		return
+	}
+	a.uiClosing.Store(true)
 }
 
 func (a *windowsApp) create() error {
 	return MainWindow{
 		AssignTo: &a.mw,
-		Title:    "Duplicate File Finder",
+		Title:    "TwinTidy - Safe Duplicate File Review",
 		Size:     Size{Width: 1440, Height: 860},
 		MinSize:  Size{Width: 1120, Height: 700},
 		Font:     macBodyFont(),
@@ -161,7 +211,7 @@ func (a *windowsApp) create() error {
 				Vertical: true,
 				Layout:   HBox{Margins: Margins{Left: 12, Top: 9, Right: 12, Bottom: 9}, Spacing: 8},
 				Children: []Widget{
-					Label{Text: "Duplicate File Finder", Font: macTitleFont(), TextColor: macInk, MinSize: Size{Width: 190}},
+					Label{Text: "TwinTidy", Font: macTitleFont(), TextColor: macInk, MinSize: Size{Width: 190}},
 					HSpacer{},
 					PushButton{AssignTo: &a.selectFolderButton, Text: "Select Folder", Font: macControlFont(), OnClicked: a.selectFolder},
 					PushButton{AssignTo: &a.scanButton, Text: "Scan", Font: macControlFont(), Background: SolidColorBrush{Color: macAccentBlue}, OnClicked: a.startScan},
@@ -169,6 +219,7 @@ func (a *windowsApp) create() error {
 					PushButton{AssignTo: &a.clearButton, Text: "Clear Results", Font: macControlFont(), OnClicked: a.clearResults},
 					PushButton{AssignTo: &a.resetButton, Text: "Reset", Font: macControlFont(), OnClicked: a.resetAll},
 					PushButton{AssignTo: &a.logButton, Text: "Open Logs", Font: macControlFont(), OnClicked: a.openLogs},
+					PushButton{Text: "About", Font: macControlFont(), OnClicked: a.showAbout},
 				},
 			},
 			Label{AssignTo: &a.folderLabel, Text: "No folder selected", TextColor: macSecondaryInk, Font: macBodyFont()},
@@ -233,9 +284,9 @@ func (a *windowsApp) create() error {
 					PushButton{AssignTo: &a.keepOldestButton, Text: "Keep Oldest", Font: macControlFont(), OnClicked: a.selectAllExceptOldest},
 					PushButton{AssignTo: &a.clearSelectButton, Text: "Clear Selection", Font: macControlFont(), OnClicked: a.clearSelection},
 					PushButton{AssignTo: &a.openButton, Text: "Show In Explorer", Font: macControlFont(), OnClicked: a.showSelectedInExplorer},
-					PushButton{AssignTo: &a.richPreviewButton, Text: "Rich Preview", Font: macControlFont(), OnClicked: a.showSelectedRichPreview},
+					PushButton{AssignTo: &a.previewSafetyButton, Text: "Preview Safety", Font: macControlFont(), OnClicked: a.showPreviewSafety},
 					HSpacer{},
-					PushButton{AssignTo: &a.deleteButton, Text: "Delete Selected", Font: macControlFont(), Background: SolidColorBrush{Color: macDangerRed}, OnClicked: a.confirmDeleteSelected},
+					PushButton{AssignTo: &a.deleteButton, Text: "Recycle Checked", Font: macControlFont(), Background: SolidColorBrush{Color: macDangerRed}, OnClicked: a.confirmDeleteSelected},
 				},
 			},
 			HSplitter{
@@ -286,12 +337,17 @@ func (a *windowsApp) create() error {
 								StretchFactor: 4,
 							},
 							WebView{
-								AssignTo:         &a.webPreview,
-								Background:       SolidColorBrush{Color: walk.RGB(255, 255, 255)},
-								Visible:          false,
-								MinSize:          Size{Width: 500, Height: 430},
-								StretchFactor:    4,
-								ShortcutsEnabled: true,
+								AssignTo:                 &a.webPreview,
+								Background:               SolidColorBrush{Color: walk.RGB(255, 255, 255)},
+								Visible:                  false,
+								MinSize:                  Size{Width: 500, Height: 430},
+								StretchFactor:            4,
+								NativeContextMenuEnabled: false,
+								ShortcutsEnabled:         false,
+								OnNavigating:             a.guardPreviewNavigation,
+								OnNewWindow: func(event *walk.WebViewNewWindowEventData) {
+									event.SetCanceled(true)
+								},
 							},
 							TextEdit{
 								AssignTo:      &a.previewText,
@@ -313,18 +369,83 @@ func (a *windowsApp) create() error {
 }
 
 func (a *windowsApp) setInitialState() {
-	_ = a.scanButton.SetText("Surface Scan")
-	a.scanButton.SetEnabled(false)
-	a.cancelButton.SetEnabled(false)
-	a.clearButton.SetEnabled(false)
-	a.keepNewestButton.SetEnabled(false)
-	a.keepOldestButton.SetEnabled(false)
-	a.clearSelectButton.SetEnabled(false)
-	a.openButton.SetEnabled(false)
-	a.richPreviewButton.SetEnabled(false)
-	a.deleteButton.SetEnabled(false)
 	a.clearFileFocus()
-	a.setPreviewMessage("Select a duplicate row to show an Explorer-style visual preview and verification details.")
+	if scanner.RecycleSupported() {
+		a.setPreviewMessage("Select a duplicate row to show an Explorer-style visual preview and verification details.")
+	} else {
+		_ = a.deleteButton.SetText("Recycle Unavailable")
+		a.setPreviewMessage("Safe cleanup is disabled in this pre-release build. Scanning, exact-match verification, selection, and previews remain available; no file will be recycled.")
+	}
+	a.renderFromPhase()
+}
+
+type phaseControls struct {
+	selectFolder   bool
+	scan           bool
+	cancel         bool
+	clear          bool
+	reset          bool
+	fileFocus      bool
+	table          bool
+	resultActions  bool
+	deleteSelected bool
+	scanText       string
+}
+
+func controlsForOperation(state *operationState, hasRows, hasDuplicates bool, checkedCount int) phaseControls {
+	reviewable := state.phase == phaseSurfaceReady || state.phase == phaseResultsReady
+	resultActions := state.phase == phaseResultsReady && hasDuplicates
+	scanText := "Surface Scan"
+	switch state.phase {
+	case phaseSurfaceReady, phaseDuplicateScanning, phaseDuplicateCancelling, phaseResultsReady, phaseDeleting, phaseClosingAfterDelete:
+		scanText = "Find Duplicates"
+	}
+
+	return phaseControls{
+		selectFolder:   state.canChangeFolder(),
+		scan:           state.phase == phaseFolderReady || state.phase == phaseSurfaceReady,
+		cancel:         state.phase == phaseSurfaceScanning || state.phase == phaseDuplicateScanning,
+		clear:          reviewable && hasRows,
+		reset:          state.canReset(),
+		fileFocus:      reviewable,
+		table:          reviewable,
+		resultActions:  resultActions,
+		deleteSelected: resultActions && checkedCount > 0,
+		scanText:       scanText,
+	}
+}
+
+func (a *windowsApp) renderFromPhase() {
+	hasRows := len(a.model.rows) > 0
+	hasDuplicates := rowsContainDuplicates(a.model.rows)
+	controls := controlsForOperation(&a.operation, hasRows, hasDuplicates, a.model.selectedCount())
+
+	a.selectFolderButton.SetEnabled(controls.selectFolder)
+	_ = a.scanButton.SetText(controls.scanText)
+	a.scanButton.SetEnabled(controls.scan)
+	a.cancelButton.SetEnabled(controls.cancel)
+	a.clearButton.SetEnabled(controls.clear)
+	a.resetButton.SetEnabled(controls.reset)
+	a.setFileFocusEnabled(controls.fileFocus)
+	a.table.SetEnabled(controls.table)
+	a.keepNewestButton.SetEnabled(controls.resultActions)
+	a.keepOldestButton.SetEnabled(controls.resultActions)
+	a.clearSelectButton.SetEnabled(controls.resultActions)
+	a.deleteButton.SetEnabled(controls.deleteSelected && scanner.RecycleSupported())
+
+	currentIndex := a.table.CurrentIndex()
+	hasCurrentRow := controls.table && currentIndex >= 0 && currentIndex < len(a.model.rows)
+	a.openButton.SetEnabled(hasCurrentRow)
+	a.previewSafetyButton.SetEnabled(hasCurrentRow)
+}
+
+func rowsContainDuplicates(rows []duplicateRow) bool {
+	for _, row := range rows {
+		if row.Duplicate {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *windowsApp) categoryChecks() []categoryCheck {
@@ -374,7 +495,6 @@ func (a *windowsApp) updateFileFocusFromSurfaceReport() {
 		stats := a.surfaceReport.CategoryStats[item.category]
 		_ = item.check.SetText(fmt.Sprintf("%s (%d)", item.label, stats.Files))
 		item.check.SetChecked(stats.Files > 0)
-		item.check.SetEnabled(stats.Files > 0)
 	}
 	_ = a.focusLabel.SetText(fmt.Sprintf("Surface scan found %d user-created file(s), skipped %d system/app item(s). Select file types, then run duplicate scan.", a.surfaceReport.TotalFiles, a.surfaceReport.SkippedSystemItems))
 }
@@ -396,16 +516,20 @@ type categoryCheck struct {
 }
 
 func (a *windowsApp) selectFolder() {
-	path, accepted, err := showModernFolderDialog(a.mw, "Select folder to scan", a.selectedFolder)
+	if !a.operation.canChangeFolder() {
+		return
+	}
+
+	path, accepted, err := showModernFolderDialog(a.mw, "Select folder to scan", a.operation.folder)
 	if err != nil {
-		diagnostics.Logf("modern folder picker failed; falling back to legacy picker: %v", err)
+		diagnostics.Logf("modern folder picker failed; falling back to legacy picker: error_type=%T", err)
 		dlg := walk.FileDialog{
 			Title:          "Select folder to scan",
-			InitialDirPath: a.selectedFolder,
+			InitialDirPath: a.operation.folder,
 		}
 		accepted, err = dlg.ShowBrowseFolder(a.mw)
 		if err != nil {
-			walk.MsgBox(a.mw, "Folder Selection Failed", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+			walk.MsgBox(a.mw, "Folder Selection Failed", displayUntrustedText(err.Error()), walk.MsgBoxOK|walk.MsgBoxIconError)
 			return
 		}
 		path = dlg.FilePath
@@ -413,86 +537,112 @@ func (a *windowsApp) selectFolder() {
 	if !accepted {
 		return
 	}
-	a.selectedFolder = path
-	a.surfaceReady = false
+	if err := a.operation.selectFolder(path); err != nil {
+		diagnostics.Logf("folder selection rejected: phase=%s error_type=%T", a.operation.phase, err)
+		return
+	}
+
 	a.surfaceReport = scanner.SurfaceReport{}
+	a.model.setRows(nil)
+	if a.table != nil {
+		_ = a.table.SetSelectedIndexes(nil)
+		_ = a.table.SetCurrentIndex(-1)
+	}
+	a.publishRows()
+	a.progress.SetValue(0)
 	a.clearFileFocus()
-	diagnostics.Logf("folder selected: %q", a.selectedFolder)
-	_ = a.folderLabel.SetText(a.selectedFolder)
-	_ = a.currentLabel.SetText(a.selectedFolder)
+	diagnostics.Logf("folder selected: revision=%d", a.operation.folderRevision)
+	_ = a.folderLabel.SetText(displayFilesystemPath(a.operation.folder))
+	_ = a.stageLabel.SetText(string(scanner.StageIdle))
+	_ = a.filesLabel.SetText("0 files")
+	_ = a.elapsedLabel.SetText("0s")
+	_ = a.currentLabel.SetText(displayFilesystemPath(a.operation.folder))
 	_ = a.statusLabel.SetText("Ready to scan.")
-	_ = a.scanButton.SetText("Surface Scan")
-	a.scanButton.SetEnabled(true)
+	a.setPreviewMessage("Run a surface scan to inventory eligible user-created files.")
+	a.renderFromPhase()
 }
 
 func (a *windowsApp) startScan() {
-	if a.selectedFolder == "" {
+	if a.operation.folder == "" {
 		walk.MsgBox(a.mw, "Select Folder", "Choose a folder before scanning.", walk.MsgBoxOK|walk.MsgBoxIconInformation)
 		return
 	}
 
-	if !a.surfaceReady {
+	switch a.operation.phase {
+	case phaseFolderReady:
 		a.startSurfaceScan()
-		return
+	case phaseSurfaceReady:
+		a.startDuplicateScan()
+	default:
+		diagnostics.Logf("scan request ignored in phase=%s", a.operation.phase)
 	}
+}
 
-	a.startDuplicateScan()
+func scanCrashFields(token operationToken) map[string]string {
+	return map[string]string{
+		"generation":      fmt.Sprint(token.generation),
+		"folder_revision": fmt.Sprint(token.folderRevision),
+	}
 }
 
 func (a *windowsApp) startSurfaceScan() {
+	ctx, cancel := context.WithCancel(context.Background())
+	token, err := a.operation.beginSurfaceScan(time.Now(), cancel)
+	if err != nil {
+		cancel()
+		diagnostics.Logf("surface scan start rejected: phase=%s error_type=%T", a.operation.phase, err)
+		return
+	}
+
+	a.surfaceReport = scanner.SurfaceReport{}
 	a.model.setRows(nil)
 	a.publishRows()
 	a.progress.SetValue(0)
 	_ = a.stageLabel.SetText(string(scanner.StageSurfaceScan))
 	_ = a.filesLabel.SetText("0 files")
 	_ = a.elapsedLabel.SetText("0s")
-	_ = a.currentLabel.SetText(a.selectedFolder)
+	_ = a.currentLabel.SetText(displayFilesystemPath(token.folder))
 	_ = a.statusLabel.SetText("Starting surface scan.")
 	a.setPreviewMessage("Scanning user-created files only. System, app, executable, and dependency files are skipped.")
+	a.renderFromPhase()
 
-	a.scanButton.SetEnabled(false)
-	a.cancelButton.SetEnabled(true)
-	a.clearButton.SetEnabled(false)
-	a.setResultActionsEnabled(false)
-	a.setFileFocusEnabled(false)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.scanCancel = cancel
-	a.scanStartedAt = time.Now()
-	folder := a.selectedFolder
-	diagnostics.Logf("surface scan started: folder=%q", folder)
+	folder := token.folder
+	diagnostics.Logf("surface scan started: generation=%d folder_revision=%d", token.generation, token.folderRevision)
 
 	updates := make(chan scanner.Progress, 512)
 	done := make(chan struct{})
 
 	go func() {
 		defer func() {
-			if err := diagnostics.RecoverToError("gui progress updater", map[string]string{"folder": folder}); err != nil {
-				diagnostics.Logf("%v", err)
+			recovered := recover()
+			if err := diagnostics.PanicToError("gui progress updater", recovered, scanCrashFields(token)); err != nil {
+				diagnostics.Logf("gui progress updater recovered: generation=%d", token.generation)
 			}
 		}()
-		a.consumeProgress(updates)
+		a.consumeProgress(token, updates)
 	}()
 	go func() {
 		defer func() {
-			if err := diagnostics.RecoverToError("gui elapsed timer", map[string]string{"folder": folder}); err != nil {
-				diagnostics.Logf("%v", err)
+			recovered := recover()
+			if err := diagnostics.PanicToError("gui elapsed timer", recovered, scanCrashFields(token)); err != nil {
+				diagnostics.Logf("gui elapsed timer recovered: generation=%d", token.generation)
 			}
 		}()
-		a.tickElapsed(ctx, done, a.scanStartedAt)
+		a.tickElapsed(token, ctx, done)
 	}()
 	go func() {
 		var report scanner.SurfaceReport
 		var err error
 		defer func() {
-			if crashErr := diagnostics.RecoverToError("surface scan workflow", map[string]string{"folder": folder}); crashErr != nil {
+			recovered := recover()
+			if crashErr := diagnostics.PanicToError("surface scan workflow", recovered, scanCrashFields(token)); crashErr != nil {
 				err = crashErr
 			}
-			diagnostics.Logf("surface scan ended: folder=%q files=%d err=%v", folder, report.TotalFiles, err)
+			diagnostics.Logf("surface scan ended: generation=%d files=%d failed=%t", token.generation, report.TotalFiles, err != nil)
 			close(updates)
 			close(done)
-			a.mw.Synchronize(func() {
-				a.surfaceScanFinished(report, err)
+			a.synchronizeUI(func() {
+				a.surfaceScanFinished(token, report, err)
 			})
 		}()
 
@@ -507,76 +657,80 @@ func (a *windowsApp) startDuplicateScan() {
 		return
 	}
 
-	a.model.setRows(nil)
-	a.publishRows()
+	files := append([]scanner.FileRecord(nil), a.surfaceReport.Files...)
+	ctx, cancel := context.WithCancel(context.Background())
+	token, err := a.operation.beginDuplicateScan(time.Now(), cancel)
+	if err != nil {
+		cancel()
+		diagnostics.Logf("duplicate scan start rejected: phase=%s error_type=%T", a.operation.phase, err)
+		return
+	}
+
 	a.progress.SetValue(0)
 	_ = a.stageLabel.SetText(string(scanner.StageSizeMapping))
 	_ = a.filesLabel.SetText("0 files")
 	_ = a.elapsedLabel.SetText("0s")
-	_ = a.currentLabel.SetText(a.selectedFolder)
+	_ = a.currentLabel.SetText(displayFilesystemPath(token.folder))
 	_ = a.statusLabel.SetText("Finding exact duplicates in selected user file types.")
 	a.setPreviewMessage("Finding exact duplicates in the selected user-created file categories.")
+	a.renderFromPhase()
 
-	a.scanButton.SetEnabled(false)
-	a.cancelButton.SetEnabled(true)
-	a.clearButton.SetEnabled(false)
-	a.setResultActionsEnabled(false)
-	a.setFileFocusEnabled(false)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.scanCancel = cancel
-	a.scanStartedAt = time.Now()
-	folder := a.selectedFolder
-	diagnostics.Logf("duplicate scan started: folder=%q categories=%s", folder, categorySelectionSummary(categories))
+	diagnostics.Logf("duplicate scan started: generation=%d folder_revision=%d categories=%s", token.generation, token.folderRevision, categorySelectionSummary(categories))
 
 	updates := make(chan scanner.Progress, 512)
 	done := make(chan struct{})
 
 	go func() {
 		defer func() {
-			if err := diagnostics.RecoverToError("gui progress updater", map[string]string{"folder": folder}); err != nil {
-				diagnostics.Logf("%v", err)
+			recovered := recover()
+			if err := diagnostics.PanicToError("gui progress updater", recovered, scanCrashFields(token)); err != nil {
+				diagnostics.Logf("gui progress updater recovered: generation=%d", token.generation)
 			}
 		}()
-		a.consumeProgress(updates)
+		a.consumeProgress(token, updates)
 	}()
 	go func() {
 		defer func() {
-			if err := diagnostics.RecoverToError("gui elapsed timer", map[string]string{"folder": folder}); err != nil {
-				diagnostics.Logf("%v", err)
+			recovered := recover()
+			if err := diagnostics.PanicToError("gui elapsed timer", recovered, scanCrashFields(token)); err != nil {
+				diagnostics.Logf("gui elapsed timer recovered: generation=%d", token.generation)
 			}
 		}()
-		a.tickElapsed(ctx, done, a.scanStartedAt)
+		a.tickElapsed(token, ctx, done)
 	}()
 	go func() {
 		var groups []scanner.DuplicateGroup
 		var err error
 		defer func() {
-			if crashErr := diagnostics.RecoverToError("duplicate scan workflow", map[string]string{"folder": folder}); crashErr != nil {
+			recovered := recover()
+			if crashErr := diagnostics.PanicToError("duplicate scan workflow", recovered, scanCrashFields(token)); crashErr != nil {
 				err = crashErr
 			}
-			diagnostics.Logf("duplicate scan ended: folder=%q groups=%d err=%v", folder, len(groups), err)
+			diagnostics.Logf("duplicate scan ended: generation=%d groups=%d failed=%t", token.generation, len(groups), err != nil)
 			close(updates)
 			close(done)
-			a.mw.Synchronize(func() {
-				a.scanFinished(groups, err)
+			a.synchronizeUI(func() {
+				a.scanFinished(token, groups, err)
 			})
 		}()
 
-		groups, err = a.engine.ScanFiles(ctx, a.surfaceReport.Files, scanner.ScanOptions{
+		groups, err = a.engine.ScanFiles(ctx, files, scanner.ScanOptions{
 			Categories:    categories,
 			UserFilesOnly: true,
 		}, updates)
 	}()
 }
 
-func (a *windowsApp) consumeProgress(updates <-chan scanner.Progress) {
+func (a *windowsApp) consumeProgress(token operationToken, updates <-chan scanner.Progress) {
 	for progress := range updates {
 		p := progress
-		a.mw.Synchronize(func() {
+		a.synchronizeUI(func() {
+			if !a.operation.accepts(token) {
+				return
+			}
 			_ = a.stageLabel.SetText(string(p.Stage))
 			if p.CurrentPath != "" {
-				_ = a.currentLabel.SetText(p.CurrentPath)
+				_ = a.currentLabel.SetText(displayFilesystemPath(p.CurrentPath))
 			}
 			if p.FilesTotal > 0 {
 				_ = a.filesLabel.SetText(fmt.Sprintf("%d / %d files", p.FilesProcessed, p.FilesTotal))
@@ -601,7 +755,7 @@ func (a *windowsApp) consumeProgress(updates <-chan scanner.Progress) {
 	}
 }
 
-func (a *windowsApp) tickElapsed(ctx context.Context, done <-chan struct{}, startedAt time.Time) {
+func (a *windowsApp) tickElapsed(token operationToken, ctx context.Context, done <-chan struct{}) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -611,70 +765,70 @@ func (a *windowsApp) tickElapsed(ctx context.Context, done <-chan struct{}, star
 		case <-done:
 			return
 		case <-ticker.C:
-			elapsed := formatDuration(time.Since(startedAt))
-			a.mw.Synchronize(func() {
+			elapsed := formatDuration(time.Since(token.startedAt))
+			a.synchronizeUI(func() {
+				if !a.operation.accepts(token) {
+					return
+				}
 				_ = a.elapsedLabel.SetText(elapsed)
 			})
 		}
 	}
 }
 
-func (a *windowsApp) surfaceScanFinished(report scanner.SurfaceReport, err error) {
-	a.scanCancel = nil
-	a.cancelButton.SetEnabled(false)
-	a.scanButton.SetEnabled(a.selectedFolder != "")
+func (a *windowsApp) surfaceScanFinished(token operationToken, report scanner.SurfaceReport, err error) {
+	cancelled := a.operation.phase == phaseSurfaceCancelling || errors.Is(err, context.Canceled)
+	if !a.operation.completeSurfaceScan(token, err == nil) {
+		diagnostics.Logf("stale surface completion ignored: generation=%d folder_revision=%d", token.generation, token.folderRevision)
+		return
+	}
 
+	if cancelled {
+		diagnostics.Logf("surface scan canceled: generation=%d folder_revision=%d", token.generation, token.folderRevision)
+		_ = a.statusLabel.SetText("Surface scan canceled.")
+		a.renderFromPhase()
+		return
+	}
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			diagnostics.Logf("surface scan canceled")
-			_ = a.statusLabel.SetText("Surface scan canceled.")
-			_ = a.scanButton.SetText("Surface Scan")
-			return
-		}
-		diagnostics.Logf("surface scan failed: %v", err)
+		diagnostics.Logf("surface scan failed: generation=%d folder_revision=%d error_type=%T", token.generation, token.folderRevision, err)
 		_ = a.statusLabel.SetText("Surface scan failed.")
-		_ = a.scanButton.SetText("Surface Scan")
-		walk.MsgBox(a.mw, "Surface Scan Failed", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		a.renderFromPhase()
+		walk.MsgBox(a.mw, "Surface Scan Failed", displayUntrustedText(err.Error()), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return
 	}
 
 	a.surfaceReport = report
-	a.surfaceReady = true
 	a.updateFileFocusFromSurfaceReport()
 	a.model.setSurfaceFiles(report.Files, "Scanned")
 	a.publishRows()
 	a.progress.SetValue(1000)
 	_ = a.stageLabel.SetText(string(scanner.StageSurfaceScan))
 	_ = a.filesLabel.SetText(fmt.Sprintf("%d user files", report.TotalFiles))
-	_ = a.elapsedLabel.SetText(formatDuration(time.Since(a.scanStartedAt)))
+	_ = a.elapsedLabel.SetText(formatDuration(time.Since(token.startedAt)))
 	_ = a.statusLabel.SetText(fmt.Sprintf("Surface scan complete. Found %d user-created file(s), skipped %d system/app item(s).", report.TotalFiles, report.SkippedSystemItems))
-	_ = a.scanButton.SetText("Find Duplicates")
-	a.clearButton.SetEnabled(len(a.model.rows) > 0)
-	a.setResultActionsEnabled(false)
 	a.setPreviewMessage("Surface scan complete. The table lists all eligible user-created files. Select file types, then run duplicate scan.")
-	diagnostics.Logf("surface results published: files=%d skipped=%d", report.TotalFiles, report.SkippedSystemItems)
+	a.renderFromPhase()
+	diagnostics.Logf("surface results published: generation=%d folder_revision=%d files=%d skipped=%d", token.generation, token.folderRevision, report.TotalFiles, report.SkippedSystemItems)
 }
 
-func (a *windowsApp) scanFinished(groups []scanner.DuplicateGroup, err error) {
-	a.scanCancel = nil
-	a.cancelButton.SetEnabled(false)
-	a.scanButton.SetEnabled(a.selectedFolder != "")
-	a.setFileFocusEnabled(a.surfaceReady)
-	if a.surfaceReady {
-		_ = a.scanButton.SetText("Find Duplicates")
-	} else {
-		_ = a.scanButton.SetText("Surface Scan")
+func (a *windowsApp) scanFinished(token operationToken, groups []scanner.DuplicateGroup, err error) {
+	cancelled := a.operation.phase == phaseDuplicateCancelling || errors.Is(err, context.Canceled)
+	if !a.operation.completeDuplicateScan(token, err == nil) {
+		diagnostics.Logf("stale duplicate completion ignored: generation=%d folder_revision=%d", token.generation, token.folderRevision)
+		return
 	}
 
+	if cancelled {
+		diagnostics.Logf("duplicate scan canceled: generation=%d folder_revision=%d", token.generation, token.folderRevision)
+		_ = a.statusLabel.SetText("Duplicate scan canceled. Surface results remain available.")
+		a.renderFromPhase()
+		return
+	}
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			diagnostics.Logf("scan canceled")
-			_ = a.statusLabel.SetText("Scan canceled.")
-			return
-		}
-		diagnostics.Logf("scan failed: %v", err)
-		_ = a.statusLabel.SetText("Scan failed.")
-		walk.MsgBox(a.mw, "Scan Failed", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		diagnostics.Logf("duplicate scan failed: generation=%d folder_revision=%d error_type=%T", token.generation, token.folderRevision, err)
+		_ = a.statusLabel.SetText("Duplicate scan failed. Surface results remain available.")
+		a.renderFromPhase()
+		walk.MsgBox(a.mw, "Scan Failed", displayUntrustedText(err.Error()), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return
 	}
 
@@ -683,11 +837,11 @@ func (a *windowsApp) scanFinished(groups []scanner.DuplicateGroup, err error) {
 	} else {
 		a.model.setGroups(groups)
 	}
-	diagnostics.Logf("scan results published: groups=%d rows=%d", len(groups), len(a.model.rows))
+	diagnostics.Logf("scan results published: generation=%d folder_revision=%d groups=%d rows=%d", token.generation, token.folderRevision, len(groups), len(a.model.rows))
 	a.publishRows()
 	a.progress.SetValue(1000)
 	_ = a.stageLabel.SetText(string(scanner.StageDone))
-	_ = a.elapsedLabel.SetText(formatDuration(time.Since(a.scanStartedAt)))
+	_ = a.elapsedLabel.SetText(formatDuration(time.Since(token.startedAt)))
 	if len(groups) == 0 {
 		_ = a.statusLabel.SetText(fmt.Sprintf("No exact duplicates found. Showing %d scanned file(s) from the selected focus categories.", len(a.model.rows)))
 		a.setPreviewMessage("No exact duplicates were found. The table remains populated for review, preview, and opening file locations.")
@@ -696,9 +850,7 @@ func (a *windowsApp) scanFinished(groups []scanner.DuplicateGroup, err error) {
 		a.setPreviewMessage("Select a row to inspect file details, exact hash, and a visual preview for supported file types.")
 	}
 
-	a.clearButton.SetEnabled(len(a.model.rows) > 0)
-	a.setResultActionsEnabled(len(groups) > 0)
-	a.updateDeleteActionState()
+	a.renderFromPhase()
 }
 
 func (a *windowsApp) surfaceFilesForSelectedCategories() []scanner.FileRecord {
@@ -721,40 +873,51 @@ func (a *windowsApp) surfaceFilesForSelectedCategories() []scanner.FileRecord {
 }
 
 func (a *windowsApp) cancelScan() {
-	if a.scanCancel != nil {
-		a.scanCancel()
+	if a.operation.requestScanCancellation() {
+		_ = a.statusLabel.SetText("Cancelling scan. Waiting for active file work to stop.")
+		a.renderFromPhase()
 	}
 }
 
 func (a *windowsApp) clearResults() {
+	phase := a.operation.phase
+	if phase != phaseSurfaceReady && phase != phaseResultsReady {
+		return
+	}
+	if phase == phaseResultsReady {
+		if err := a.operation.clearResults(); err != nil {
+			diagnostics.Logf("clear results rejected: phase=%s error_type=%T", a.operation.phase, err)
+			return
+		}
+	}
+
 	a.model.setRows(nil)
+	if a.table != nil {
+		_ = a.table.SetSelectedIndexes(nil)
+		_ = a.table.SetCurrentIndex(-1)
+	}
 	a.publishRows()
 	a.progress.SetValue(0)
-	if a.surfaceReady {
-		_ = a.stageLabel.SetText(string(scanner.StageSurfaceScan))
-		_ = a.statusLabel.SetText("Duplicate results cleared. Adjust file focus or run duplicate scan again.")
-		_ = a.scanButton.SetText("Find Duplicates")
-		a.scanButton.SetEnabled(true)
-		a.setFileFocusEnabled(true)
-	} else {
-		_ = a.stageLabel.SetText(string(scanner.StageIdle))
-		_ = a.statusLabel.SetText("Results cleared.")
-		_ = a.scanButton.SetText("Surface Scan")
-		a.scanButton.SetEnabled(a.selectedFolder != "")
-	}
+	_ = a.stageLabel.SetText(string(scanner.StageSurfaceScan))
+	_ = a.statusLabel.SetText("Results cleared. Adjust file focus or run duplicate scan again.")
 	_ = a.filesLabel.SetText("0 files")
-	_ = a.currentLabel.SetText(a.selectedFolder)
+	_ = a.currentLabel.SetText(displayFilesystemPath(a.operation.folder))
 	a.setPreviewMessage("Results cleared. Start a scan to find exact duplicates.")
-	a.clearButton.SetEnabled(false)
-	a.setResultActionsEnabled(false)
+	a.renderFromPhase()
 }
 
 func (a *windowsApp) resetAll() {
-	a.cancelScan()
-	a.selectedFolder = ""
-	a.surfaceReady = false
+	if err := a.operation.reset(); err != nil {
+		diagnostics.Logf("reset rejected: phase=%s error_type=%T", a.operation.phase, err)
+		return
+	}
+
 	a.surfaceReport = scanner.SurfaceReport{}
 	a.model.setRows(nil)
+	if a.table != nil {
+		_ = a.table.SetSelectedIndexes(nil)
+		_ = a.table.SetCurrentIndex(-1)
+	}
 	a.publishRows()
 	a.progress.SetValue(0)
 	_ = a.folderLabel.SetText("No folder selected")
@@ -763,13 +926,9 @@ func (a *windowsApp) resetAll() {
 	_ = a.elapsedLabel.SetText("0s")
 	_ = a.currentLabel.SetText("-")
 	_ = a.statusLabel.SetText("Select a folder to start.")
-	_ = a.scanButton.SetText("Surface Scan")
 	a.clearFileFocus()
 	a.setPreviewMessage("Select a duplicate row to show an Explorer-style visual preview and verification details.")
-	a.scanButton.SetEnabled(false)
-	a.cancelButton.SetEnabled(false)
-	a.clearButton.SetEnabled(false)
-	a.setResultActionsEnabled(false)
+	a.renderFromPhase()
 }
 
 func (a *windowsApp) openLogs() {
@@ -779,12 +938,20 @@ func (a *windowsApp) openLogs() {
 		return
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		walk.MsgBox(a.mw, "Logs", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		walk.MsgBox(a.mw, "Logs", displayUntrustedText(err.Error()), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return
 	}
-	if err := exec.Command("explorer.exe", dir).Start(); err != nil {
-		walk.MsgBox(a.mw, "Logs", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+	if err := startExplorer(dir, false); err != nil {
+		walk.MsgBox(a.mw, "Logs", "Could not open the diagnostics folder.\r\n\r\nFolder: "+displayFilesystemPath(dir), walk.MsgBoxOK|walk.MsgBoxIconError)
 	}
+}
+
+func (a *windowsApp) showAbout() {
+	message := buildinfo.Summary() +
+		"\r\n\r\nTwinTidy finds and reviews byte-for-byte duplicate files. Cleanup is disabled in this pre-release build until the Windows Recycle Bin operation can remain bound to the verified file identity." +
+		"\r\n\r\nLocal-only processing. No telemetry. No file deletion." +
+		"\r\n\r\nProduction targets: Windows x64 and ARM64."
+	walk.MsgBox(a.mw, "About TwinTidy", message, walk.MsgBoxOK|walk.MsgBoxIconInformation)
 }
 
 func (a *windowsApp) selectAllExceptNewest() {
@@ -819,84 +986,361 @@ func (a *windowsApp) showSelectedInExplorer() {
 		return
 	}
 	path := a.model.rows[index].File.Path
-	_ = exec.Command("explorer.exe", "/select,"+path).Start()
+	if err := startExplorer(path, true); err != nil {
+		walk.MsgBox(a.mw, "Show In Explorer", "Windows Explorer could not show the selected file.\r\n\r\nFile: "+displayFilesystemPath(path), walk.MsgBoxOK|walk.MsgBoxIconError)
+	}
+}
+
+func startExplorer(path string, selectFile bool) error {
+	explorer, err := trustedExplorerPath()
+	if err != nil {
+		return err
+	}
+	args := []string{path}
+	if selectFile {
+		args[0] = "/select," + path
+	}
+	return exec.Command(explorer, args...).Start()
+}
+
+const (
+	maxRecycleConfirmationEntries = 40
+	maxRecycleConfirmationChars   = 8000
+)
+
+var (
+	errRecycleWouldRemoveAllCopies = errors.New("recycle selection would remove every physical copy in a duplicate group")
+	errRecycleConfirmationTooLarge = errors.New("recycle confirmation is too large for the native confirmation dialog")
+)
+
+type plannedRecycleGroup struct {
+	groupNumber int
+	request     scanner.RecycleRequest
+}
+
+type recyclePlan struct {
+	groups        []plannedRecycleGroup
+	selectedCount int
+}
+
+type recycleGroupResult struct {
+	groupNumber int
+	result      scanner.RecycleResult
+}
+
+type recycleBatchResult struct {
+	groups        []recycleGroupResult
+	internalError string
+}
+
+type recycleOutcome struct {
+	recycled        int
+	changed         int
+	protected       int
+	cancelled       int
+	failed          int
+	requestErrors   []string
+	internalError   string
+	nonRecycledRows []scanner.RecycleItemResult
+}
+
+type physicalCopyKey struct {
+	identity scanner.FileIdentity
+	path     string
+}
+
+func recyclePhysicalCopyKey(file scanner.FileRecord) physicalCopyKey {
+	if file.Identity != (scanner.FileIdentity{}) {
+		return physicalCopyKey{identity: file.Identity}
+	}
+	return physicalCopyKey{path: strings.ToLower(filepath.Clean(file.Path))}
+}
+
+func buildRecyclePlan(rows []duplicateRow) (recyclePlan, error) {
+	type groupAccumulator struct {
+		groupNumber int
+		hash        string
+		size        int64
+		files       []scanner.FileRecord
+		selected    []scanner.FileRecord
+	}
+
+	groups := make(map[string]*groupAccumulator)
+	order := make([]string, 0)
+	for _, row := range rows {
+		if !row.Duplicate {
+			continue
+		}
+		key := row.Key
+		if key == "" {
+			key = fmt.Sprintf("%d:%s", row.File.Size, row.Hash)
+		}
+		group := groups[key]
+		if group == nil {
+			group = &groupAccumulator{groupNumber: row.Group, hash: row.Hash, size: row.File.Size}
+			groups[key] = group
+			order = append(order, key)
+		}
+		if group.hash != row.Hash || group.size != row.File.Size {
+			return recyclePlan{}, fmt.Errorf("duplicate group %d contains inconsistent scan data", group.groupNumber)
+		}
+		group.files = append(group.files, row.File)
+		if row.Selected {
+			group.selected = append(group.selected, row.File)
+		}
+	}
+
+	plan := recyclePlan{groups: make([]plannedRecycleGroup, 0, len(order))}
+	for _, key := range order {
+		group := groups[key]
+		if len(group.selected) == 0 {
+			continue
+		}
+
+		allCopies := make(map[physicalCopyKey]struct{}, len(group.files))
+		selectedCopies := make(map[physicalCopyKey]struct{}, len(group.selected))
+		for _, file := range group.files {
+			allCopies[recyclePhysicalCopyKey(file)] = struct{}{}
+		}
+		for _, file := range group.selected {
+			selectedCopies[recyclePhysicalCopyKey(file)] = struct{}{}
+		}
+		if len(allCopies) == 0 || len(selectedCopies) >= len(allCopies) {
+			return recyclePlan{}, fmt.Errorf("group %d: %w", group.groupNumber, errRecycleWouldRemoveAllCopies)
+		}
+
+		files := append([]scanner.FileRecord(nil), group.files...)
+		selected := append([]scanner.FileRecord(nil), group.selected...)
+		plan.groups = append(plan.groups, plannedRecycleGroup{
+			groupNumber: group.groupNumber,
+			request: scanner.RecycleRequest{
+				Group: scanner.DuplicateGroup{
+					Size:  group.size,
+					Hash:  group.hash,
+					Files: files,
+				},
+				Selected: selected,
+			},
+		})
+		plan.selectedCount += len(selected)
+	}
+	if plan.selectedCount == 0 {
+		return recyclePlan{}, errors.New("no checked duplicate files were selected")
+	}
+	return plan, nil
+}
+
+func recycleConfirmationMessage(plan recyclePlan) (string, error) {
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("Move exactly %d checked duplicate file(s) to the Windows Recycle Bin?\r\n\r\n", plan.selectedCount))
+	builder.WriteString("TwinTidy preserves at least one physical copy per group and revalidates file identity, content, and keeper availability immediately before each recycle operation. Changed, protected, cancelled, or failed files remain in place.\r\n")
+	builder.WriteString("TwinTidy uses the Windows Recycle Bin only and never permanently deletes files.\r\n\r\n")
+
+	entryCount := 0
+	for _, planned := range plan.groups {
+		builder.WriteString(fmt.Sprintf("Group %d\r\n", planned.groupNumber))
+		selectedPaths := make(map[string]struct{}, len(planned.request.Selected))
+		for _, selected := range planned.request.Selected {
+			selectedPaths[strings.ToLower(filepath.Clean(selected.Path))] = struct{}{}
+			builder.WriteString("  RECYCLE: ")
+			builder.WriteString(displayFilesystemPath(selected.Path))
+			builder.WriteString("\r\n")
+			entryCount++
+		}
+		for _, file := range planned.request.Group.Files {
+			if _, selected := selectedPaths[strings.ToLower(filepath.Clean(file.Path))]; selected {
+				continue
+			}
+			builder.WriteString("  KEEP:    ")
+			builder.WriteString(displayFilesystemPath(file.Path))
+			builder.WriteString("\r\n")
+			entryCount++
+		}
+		builder.WriteString("\r\n")
+	}
+
+	if entryCount > maxRecycleConfirmationEntries || builder.Len() > maxRecycleConfirmationChars {
+		return "", errRecycleConfirmationTooLarge
+	}
+	return builder.String(), nil
 }
 
 func (a *windowsApp) confirmDeleteSelected() {
-	paths := a.deleteCandidatePaths()
-	if len(paths) == 0 {
-		walk.MsgBox(a.mw, "No Selection", "Select duplicate files before deleting.", walk.MsgBoxOK|walk.MsgBoxIconInformation)
+	if !scanner.RecycleSupported() {
+		walk.MsgBox(a.mw, "Recycle Unavailable", "No files were changed. TwinTidy disables cleanup until Windows Recycle Bin operations can stay bound to the verified file identity throughout the native operation.", walk.MsgBoxOK|walk.MsgBoxIconInformation)
+		return
+	}
+	plan, err := buildRecyclePlan(a.model.rows)
+	if err != nil {
+		if errors.Is(err, errRecycleWouldRemoveAllCopies) {
+			walk.MsgBox(a.mw, "Keep One Copy", "TwinTidy will not recycle every physical copy in a duplicate group. Uncheck at least one verified keeper in each group.", walk.MsgBoxOK|walk.MsgBoxIconWarning)
+			return
+		}
+		walk.MsgBox(a.mw, "Cannot Recycle Selection", displayUntrustedText(err.Error()), walk.MsgBoxOK|walk.MsgBoxIconInformation)
 		return
 	}
 
-	message := fmt.Sprintf("Move %d selected duplicate file(s) to the Recycle Bin? If the Recycle Bin is unavailable, the app will permanently delete the selected files.", len(paths))
-	result := walk.MsgBox(a.mw, "Delete Selected Files", message, walk.MsgBoxYesNo|walk.MsgBoxIconWarning)
+	message, err := recycleConfirmationMessage(plan)
+	if err != nil {
+		walk.MsgBox(a.mw, "Review A Smaller Batch", fmt.Sprintf("This selection contains %d checked target(s) and too many target/keeper paths for the native confirmation dialog. No files were changed.\r\n\r\nSelect a smaller batch so TwinTidy can show every checked target and retained keeper before approval.", plan.selectedCount), walk.MsgBoxOK|walk.MsgBoxIconInformation)
+		return
+	}
+	result := walk.MsgBox(a.mw, "Recycle Checked Duplicates", message, walk.MsgBoxYesNo|walk.MsgBoxIconWarning)
 	if result != win.IDYES {
 		return
 	}
 
-	a.deleteButton.SetEnabled(false)
-	_ = a.statusLabel.SetText("Deleting selected files.")
-	diagnostics.Logf("delete started: selected=%d", len(paths))
-	go func(paths []string) {
-		deleteResult := scanner.DeleteResult{}
+	token, err := a.operation.beginDelete(time.Now())
+	if err != nil {
+		diagnostics.Logf("recycle start rejected: phase=%s error_type=%T", a.operation.phase, err)
+		return
+	}
+	a.setPreviewMessage("Revalidating checked duplicate files before moving them to the Windows Recycle Bin.")
+	_ = a.statusLabel.SetText("Revalidating and recycling checked duplicate files. This operation cannot be cancelled midway.")
+	a.renderFromPhase()
+	diagnostics.Logf("recycle started: generation=%d groups=%d selected=%d", token.generation, len(plan.groups), plan.selectedCount)
+
+	go func(plan recyclePlan, token operationToken) {
+		batch := recycleBatchResult{groups: make([]recycleGroupResult, 0, len(plan.groups))}
 		defer func() {
-			if crashErr := diagnostics.RecoverToError("delete workflow", map[string]string{"selected_files": fmt.Sprint(len(paths))}); crashErr != nil {
-				deleteResult.Failed = append(deleteResult.Failed, scanner.DeleteFailure{Error: crashErr.Error()})
+			fields := map[string]string{
+				"generation":     fmt.Sprint(token.generation),
+				"group_count":    fmt.Sprint(len(plan.groups)),
+				"selected_count": fmt.Sprint(plan.selectedCount),
 			}
-			diagnostics.Logf("delete ended: selected=%d deleted=%d failed=%d", len(paths), len(deleteResult.Deleted), len(deleteResult.Failed))
-			a.mw.Synchronize(func() {
-				a.applyDeleteResult(deleteResult)
+			recovered := recover()
+			if crashErr := diagnostics.PanicToError("recycle workflow", recovered, fields); crashErr != nil {
+				batch.internalError = crashErr.Error()
+			}
+			outcome := summarizeRecycleBatch(batch)
+			diagnostics.Logf("recycle ended: generation=%d recycled=%d changed=%d protected=%d cancelled=%d failed=%d request_errors=%d internal_error=%t", token.generation, outcome.recycled, outcome.changed, outcome.protected, outcome.cancelled, outcome.failed, len(outcome.requestErrors), outcome.internalError != "")
+			a.synchronizeUI(func() {
+				a.applyRecycleBatch(token, batch)
 			})
 		}()
 
-		deleteResult = scanner.DeleteFiles(paths, true)
-	}(paths)
+		ctx := context.Background()
+		for _, planned := range plan.groups {
+			batch.groups = append(batch.groups, recycleGroupResult{
+				groupNumber: planned.groupNumber,
+				result:      scanner.RecycleExactDuplicates(ctx, planned.request),
+			})
+		}
+	}(plan, token)
 }
 
-func (a *windowsApp) applyDeleteResult(result scanner.DeleteResult) {
-	deleted := make(map[string]struct{}, len(result.Deleted))
-	trashCount := 0
-	permanentCount := 0
-	for _, file := range result.Deleted {
-		deleted[file.Path] = struct{}{}
-		if file.Action == scanner.DeleteActionTrash {
-			trashCount++
-		} else {
-			permanentCount++
+func summarizeRecycleBatch(batch recycleBatchResult) recycleOutcome {
+	outcome := recycleOutcome{internalError: batch.internalError}
+	for _, group := range batch.groups {
+		if group.result.RequestError != "" {
+			outcome.requestErrors = append(outcome.requestErrors, fmt.Sprintf("Group %d: %s", group.groupNumber, group.result.RequestError))
+		}
+		for _, item := range group.result.Items {
+			switch item.Status {
+			case scanner.RecycleStatusRecycled:
+				outcome.recycled++
+			case scanner.RecycleStatusSkippedChanged:
+				outcome.changed++
+				outcome.nonRecycledRows = append(outcome.nonRecycledRows, item)
+			case scanner.RecycleStatusSkippedProtected:
+				outcome.protected++
+				outcome.nonRecycledRows = append(outcome.nonRecycledRows, item)
+			case scanner.RecycleStatusCancelled:
+				outcome.cancelled++
+				outcome.nonRecycledRows = append(outcome.nonRecycledRows, item)
+			default:
+				outcome.failed++
+				outcome.nonRecycledRows = append(outcome.nonRecycledRows, item)
+			}
 		}
 	}
+	return outcome
+}
 
-	a.model.removeDeleted(deleted)
+func retainedRecycleStatus(status scanner.RecycleStatus) string {
+	switch status {
+	case scanner.RecycleStatusSkippedChanged:
+		return "Changed - kept"
+	case scanner.RecycleStatusSkippedProtected:
+		return "Protected - kept"
+	case scanner.RecycleStatusCancelled:
+		return "Cancelled - kept"
+	default:
+		return "Recycle failed - kept"
+	}
+}
+
+func applyRecycleBatchToModel(model *duplicateTableModel, batch recycleBatchResult) recycleOutcome {
+	outcome := summarizeRecycleBatch(batch)
+	itemsByPath := make(map[string]scanner.RecycleItemResult)
+	deleted := make(map[string]struct{})
+	for _, group := range batch.groups {
+		for _, item := range group.result.Items {
+			pathKey := strings.ToLower(filepath.Clean(item.Path))
+			itemsByPath[pathKey] = item
+			if item.Status == scanner.RecycleStatusRecycled {
+				deleted[item.Path] = struct{}{}
+			}
+		}
+	}
+	for index := range model.rows {
+		model.rows[index].Selected = false
+		item, exists := itemsByPath[strings.ToLower(filepath.Clean(model.rows[index].File.Path))]
+		if exists && item.Status != scanner.RecycleStatusRecycled {
+			model.rows[index].Status = retainedRecycleStatus(item.Status)
+		}
+	}
+	model.removeDeleted(deleted)
+	return outcome
+}
+
+func (a *windowsApp) applyRecycleBatch(token operationToken, batch recycleBatchResult) {
+	if !a.operation.accepts(token) {
+		diagnostics.Logf("stale recycle completion ignored: generation=%d folder_revision=%d", token.generation, token.folderRevision)
+		return
+	}
+
+	outcome := applyRecycleBatchToModel(a.model, batch)
+	accepted, shouldClose := a.operation.completeDelete(token)
+	if !accepted {
+		return
+	}
 	if a.table != nil {
 		_ = a.table.SetSelectedIndexes(nil)
 		_ = a.table.SetCurrentIndex(-1)
 	}
 	a.publishRows()
 	a.progress.SetValue(1000)
-	a.clearButton.SetEnabled(len(a.model.rows) > 0)
-	a.setResultActionsEnabled(len(a.model.rows) > 0)
-	a.updateDeleteActionState()
+	a.renderFromPhase()
 
-	status := fmt.Sprintf("Deleted %d file(s): %d moved to Recycle Bin, %d permanently removed.", len(result.Deleted), trashCount, permanentCount)
-	if len(result.Failed) > 0 {
-		status = fmt.Sprintf("%s %d file(s) could not be deleted.", status, len(result.Failed))
-		walk.MsgBox(a.mw, "Some Files Were Not Deleted", failureSummary(result.Failed), walk.MsgBoxOK|walk.MsgBoxIconWarning)
-	}
+	status := recycleOutcomeSummary(outcome)
 	_ = a.statusLabel.SetText(status)
 	if len(a.model.rows) == 0 {
-		a.setPreviewMessage("No duplicate groups remain after deletion.")
+		a.setPreviewMessage("No duplicate groups remain after the Recycle Bin operation.")
+	}
+	if shouldClose {
+		a.mw.Close()
+		return
+	}
+	if recycleOutcomeHasIssues(outcome) {
+		walk.MsgBox(a.mw, "Recycle Results", recycleIssueSummary(outcome), walk.MsgBoxOK|walk.MsgBoxIconWarning)
 	}
 }
 
 func (a *windowsApp) updatePreviewFromSelection() {
 	a.updateDeleteActionState()
+	if a.operation.phase != phaseSurfaceReady && a.operation.phase != phaseResultsReady {
+		a.invalidatePreview()
+		a.openButton.SetEnabled(false)
+		a.previewSafetyButton.SetEnabled(false)
+		return
+	}
 
 	selectedRows := a.selectedRows()
 	if len(selectedRows) > 1 {
 		a.openButton.SetEnabled(true)
-		a.richPreviewButton.SetEnabled(false)
-		a.showComparisonPreview(selectedRows)
+		a.previewSafetyButton.SetEnabled(false)
+		a.requestPreparedPreview(previewModeComparison, selectedRows)
 		return
 	}
 
@@ -904,19 +1348,13 @@ func (a *windowsApp) updatePreviewFromSelection() {
 	if index < 0 || index >= len(a.model.rows) {
 		a.setPreviewMessage("Select a duplicate row to show an Explorer-style visual preview and verification details.")
 		a.openButton.SetEnabled(false)
-		a.richPreviewButton.SetEnabled(false)
+		a.previewSafetyButton.SetEnabled(false)
 		return
 	}
 	a.openButton.SetEnabled(true)
 	row := a.model.rows[index]
-	ext := strings.ToLower(filepath.Ext(row.File.Path))
-	richSupported := isRichPreviewExt(ext)
-	a.richPreviewButton.SetEnabled(richSupported)
-	if richSupported {
-		a.showRichPreviewForRow(row)
-		return
-	}
-	a.showPreviewForRow(row)
+	a.previewSafetyButton.SetEnabled(true)
+	a.requestPreparedPreview(previewModeSingle, []duplicateRow{row})
 }
 
 func (a *windowsApp) selectedRows() []duplicateRow {
@@ -942,98 +1380,26 @@ func (a *windowsApp) selectedRows() []duplicateRow {
 	return rows
 }
 
-func (a *windowsApp) highlightedDuplicatePaths() []string {
-	rows := a.selectedRows()
-	paths := make([]string, 0, len(rows))
-	seen := make(map[string]struct{}, len(rows))
-	for _, row := range rows {
-		if !row.Duplicate {
-			continue
-		}
-		if _, ok := seen[row.File.Path]; ok {
-			continue
-		}
-		seen[row.File.Path] = struct{}{}
-		paths = append(paths, row.File.Path)
-	}
-	sort.Strings(paths)
-	return paths
-}
-
-func (a *windowsApp) deleteCandidatePaths() []string {
-	paths := a.model.selectedPaths()
-	if len(paths) > 0 {
-		return paths
-	}
-	return a.highlightedDuplicatePaths()
+func (a *windowsApp) checkedDeletePaths() []string {
+	return a.model.selectedPaths()
 }
 
 func (a *windowsApp) updateDeleteActionState() {
 	if a.deleteButton == nil {
 		return
 	}
-	a.deleteButton.SetEnabled(len(a.deleteCandidatePaths()) > 0)
-}
-
-func (a *windowsApp) setResultActionsEnabled(enabled bool) {
-	a.keepNewestButton.SetEnabled(enabled)
-	a.keepOldestButton.SetEnabled(enabled)
-	a.clearSelectButton.SetEnabled(enabled)
-	a.openButton.SetEnabled(enabled)
-	a.richPreviewButton.SetEnabled(false)
-	if enabled {
-		a.updateDeleteActionState()
-		return
-	}
-	a.deleteButton.SetEnabled(false)
+	controls := controlsForOperation(&a.operation, len(a.model.rows) > 0, rowsContainDuplicates(a.model.rows), a.model.selectedCount())
+	a.deleteButton.SetEnabled(controls.deleteSelected && scanner.RecycleSupported())
 }
 
 func (a *windowsApp) publishRows() {
+	a.invalidatePreview()
 	a.model.PublishRowsReset()
 	_ = a.table.Invalidate()
 }
 
-func (a *windowsApp) showPreviewForRow(row duplicateRow) {
-	details := previewDetailsForRow(row)
-	ext := strings.ToLower(filepath.Ext(row.File.Path))
-	if isImageExt(ext) {
-		image, err := walk.NewImageFromFileForDPI(row.File.Path, a.previewImage.DPI())
-		if err == nil {
-			a.setPreviewImage(image)
-			_ = a.previewText.SetText(details)
-			return
-		}
-		details += "\r\n\r\nVisual preview failed: " + err.Error()
-	}
-
-	if image, err := shellThumbnailImage(row.File.Path, 1200, a.previewImage.DPI()); err == nil {
-		a.setPreviewImage(image)
-		if isRichPreviewExt(ext) {
-			details += "\r\n\r\nExplorer-style thumbnail loaded. Use Rich Preview for an embedded document/media view when Windows can render this file type."
-		} else {
-			details += "\r\n\r\nExplorer-style thumbnail loaded through the Windows Shell provider."
-		}
-		_ = a.previewText.SetText(details)
-		return
-	}
-
-	a.setPreviewImage(nil)
-	if isTextExt(ext) {
-		text, err := readTextPreview(row.File.Path)
-		if err != nil {
-			details += "\r\n\r\nText preview failed: " + err.Error()
-		} else {
-			details += "\r\n\r\nText preview:\r\n" + text
-		}
-	} else {
-		fallback := fallbackForRow(row)
-		details += "\r\n\r\n" + fallback.Title + ":\r\n" + fallback.Text
-		details += "\r\n\r\nThis is an app-generated fallback preview. Use Show In Explorer for the file location, or Rich Preview when this file type has a local viewer."
-	}
-	_ = a.previewText.SetText(details)
-}
-
 func (a *windowsApp) setPreviewMessage(message string) {
+	a.invalidatePreview()
 	a.setPreviewImage(nil)
 	_ = a.previewText.SetText(message)
 }
@@ -1049,52 +1415,13 @@ func (a *windowsApp) setPreviewImage(image walk.Image) {
 	}
 }
 
-func (a *windowsApp) showComparisonPreview(rows []duplicateRow) {
-	a.setPreviewImage(nil)
-	a.previewImage.SetVisible(false)
-	a.webPreview.SetVisible(true)
-
-	page, rendered, err := buildComparisonPreviewPage(rows, maxComparisonPreviewFiles)
-	if err != nil {
-		a.webPreview.SetVisible(false)
-		a.previewImage.SetVisible(true)
-		_ = a.previewText.SetText("Comparison preview failed: " + err.Error())
-		return
-	}
-
-	_ = a.previewText.SetText(comparisonSummary(rows, rendered))
-	if err := a.webPreview.SetURL(fileURL(page)); err != nil {
-		a.webPreview.SetVisible(false)
-		a.previewImage.SetVisible(true)
-		_ = a.previewText.SetText("Comparison preview failed: " + err.Error())
-	}
-}
-
-func (a *windowsApp) showSelectedRichPreview() {
-	index := a.table.CurrentIndex()
-	if index < 0 || index >= len(a.model.rows) {
-		walk.MsgBox(a.mw, "Select A File", "Select a row first.", walk.MsgBoxOK|walk.MsgBoxIconInformation)
-		return
-	}
-	a.showRichPreviewForRow(a.model.rows[index])
-}
-
-func (a *windowsApp) showRichPreviewForRow(row duplicateRow) {
-	ext := strings.ToLower(filepath.Ext(row.File.Path))
-	if !isRichPreviewExt(ext) {
-		walk.MsgBox(a.mw, "Rich Preview", "This file type does not have an embedded rich preview path in this app.", walk.MsgBoxOK|walk.MsgBoxIconInformation)
-		return
-	}
-
-	a.setPreviewImage(nil)
-	a.previewImage.SetVisible(false)
-	a.webPreview.SetVisible(true)
-	_ = a.previewText.SetText(previewDetailsForRow(row) + "\r\n\r\nEmbedded rich preview requested. Rendering depends on Windows, Office/PDF/video handlers, and the local browser control available on this machine.")
-	if err := a.webPreview.SetURL(fileURL(row.File.Path)); err != nil {
-		a.webPreview.SetVisible(false)
-		a.previewImage.SetVisible(true)
-		_ = a.previewText.SetText(previewDetailsForRow(row) + "\r\n\r\nRich preview failed: " + err.Error())
-	}
+func (a *windowsApp) showPreviewSafety() {
+	walk.MsgBox(
+		a.mw,
+		"Preview Safety",
+		"TwinTidy does not load scanned PDF, Office, or media files into its embedded browser control. It shows Windows Shell thumbnails, bounded plain-text previews, and metadata only.\r\n\r\nUse Show In Explorer, then open a file with an application you trust if you need to inspect its full contents.",
+		walk.MsgBoxOK|walk.MsgBoxIconInformation,
+	)
 }
 
 func (m *duplicateTableModel) RowCount() int {
@@ -1117,11 +1444,11 @@ func (m *duplicateTableModel) Value(row, col int) interface{} {
 		}
 		return item.Group
 	case 3:
-		return filepath.Base(item.File.Path)
+		return displayFilesystemName(item.File.Path)
 	case 4:
 		return formatBytes(item.File.Size)
 	case 5:
-		return fileType(item.File.Path)
+		return displayUntrustedText(fileType(item.File.Path))
 	case 6:
 		return formatTime(item.File.ModifiedAt)
 	case 7:
@@ -1132,7 +1459,7 @@ func (m *duplicateTableModel) Value(row, col int) interface{} {
 		}
 		return shortHash(item.Hash)
 	case 9:
-		return item.File.Path
+		return displayFilesystemPath(item.File.Path)
 	default:
 		return ""
 	}
@@ -1322,11 +1649,11 @@ func previewDetailsForRow(row duplicateRow) string {
 		builder.WriteString(row.Hash)
 	}
 	builder.WriteString("\r\nName: ")
-	builder.WriteString(filepath.Base(row.File.Path))
+	builder.WriteString(displayFilesystemName(row.File.Path))
 	builder.WriteString("\r\nCategory: ")
 	builder.WriteString(scanner.CategoryLabel(row.File.Category))
 	builder.WriteString("\r\nType: ")
-	builder.WriteString(fileType(row.File.Path))
+	builder.WriteString(displayUntrustedText(fileType(row.File.Path)))
 	builder.WriteString("\r\nSize: ")
 	builder.WriteString(formatBytes(row.File.Size))
 	builder.WriteString("\r\nCreated: ")
@@ -1334,7 +1661,7 @@ func previewDetailsForRow(row duplicateRow) string {
 	builder.WriteString("\r\nModified: ")
 	builder.WriteString(formatTime(row.File.ModifiedAt))
 	builder.WriteString("\r\nPath: ")
-	builder.WriteString(row.File.Path)
+	builder.WriteString(displayFilesystemPath(row.File.Path))
 	return builder.String()
 }
 
@@ -1402,20 +1729,6 @@ func isImageExt(ext string) bool {
 	}
 }
 
-func isRichPreviewExt(ext string) bool {
-	switch ext {
-	case ".pdf",
-		".doc", ".docx", ".docm", ".rtf",
-		".xls", ".xlsx", ".xlsm", ".csv",
-		".ppt", ".pptx", ".pptm",
-		".mp3", ".m4a", ".aac", ".wav", ".wma", ".flac", ".ogg",
-		".mp4", ".m4v", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".mpeg", ".mpg":
-		return true
-	default:
-		return false
-	}
-}
-
 func isOfficeExt(ext string) bool {
 	switch ext {
 	case ".doc", ".docx", ".docm", ".rtf",
@@ -1454,8 +1767,8 @@ func isTextExt(ext string) bool {
 	}
 }
 
-func readTextPreview(path string) (string, error) {
-	file, err := os.Open(path)
+func readVerifiedTextPreview(record scanner.FileRecord) (string, error) {
+	file, err := scanner.OpenVerifiedRecordForRead(record)
 	if err != nil {
 		return "", err
 	}
@@ -1472,12 +1785,10 @@ func readTextPreview(path string) (string, error) {
 	return text, nil
 }
 
-func fileURL(path string) string {
-	clean := filepath.ToSlash(filepath.Clean(path))
-	if !strings.HasPrefix(clean, "/") {
-		clean = "/" + clean
+func (a *windowsApp) guardPreviewNavigation(event *walk.WebViewNavigatingEventData) {
+	if !previewNavigationAllowed(event.Url(), a.allowedPreviewURL) {
+		event.SetCanceled(true)
 	}
-	return (&url.URL{Scheme: "file", Path: clean}).String()
 }
 
 type previewFallback struct {
@@ -1493,29 +1804,34 @@ func fallbackForRow(row duplicateRow) previewFallback {
 	if label == "" {
 		label = "FILE"
 	}
+	label = displayUntrustedText(label)
 
 	switch {
 	case ext == ".pdf":
-		text, pages, err := pdfPreviewSnippet(row.File.Path)
-		title := "PDF document"
-		if pages > 0 {
-			title = fmt.Sprintf("PDF document - %d page(s)", pages)
-		}
-		if err != nil || text == "" {
-			text = "PDF preview card generated from file metadata. Use Rich Preview to inspect the full document when the local PDF viewer is available."
-		}
-		return previewFallback{Badge: "PDF", BadgeClass: "pdf", Title: title, Text: text}
+		return previewFallback{Badge: "PDF", BadgeClass: "pdf", Title: "PDF document", Text: "Shell thumbnail unavailable. TwinTidy does not parse PDF contents in-process; use Show In Explorer to inspect the file with a trusted application."}
 	case isOfficeExt(ext):
-		return previewFallback{Badge: label, BadgeClass: "office", Title: "Office document", Text: "Document thumbnail was not available. Use Rich Preview to inspect the file with local Office or browser handlers."}
+		return previewFallback{Badge: label, BadgeClass: "office", Title: "Office document", Text: "Shell thumbnail unavailable. Use Show In Explorer to inspect the file with a trusted application."}
 	case isAudioExt(ext):
 		return previewFallback{Badge: "AUDIO", BadgeClass: "audio", Title: "Audio file", Text: "Album art was not available. Verify duplicates by exact hash, size, modified date, and path."}
 	case isVideoExt(ext):
-		return previewFallback{Badge: "VIDEO", BadgeClass: "video", Title: "Video file", Text: "Frame thumbnail was not available. Use Rich Preview or Show In Explorer to play or inspect the file."}
+		return previewFallback{Badge: "VIDEO", BadgeClass: "video", Title: "Video file", Text: "Frame thumbnail was not available. Use Show In Explorer to play or inspect the file with a trusted application."}
 	case isImageExt(ext):
 		return previewFallback{Badge: "IMG", BadgeClass: "file", Title: "Image file", Text: "Image thumbnail could not be generated. Use Show In Explorer to inspect the original file."}
 	default:
 		return previewFallback{Badge: label, BadgeClass: "file", Title: "File preview", Text: "Generated metadata preview. Verify using exact hash, size, modified date, and path."}
 	}
+}
+
+func fallbackForComparisonRow(row duplicateRow) previewFallback {
+	if strings.EqualFold(filepath.Ext(row.File.Path), ".pdf") {
+		return previewFallback{
+			Badge:      "PDF",
+			BadgeClass: "pdf",
+			Title:      "PDF document",
+			Text:       "Content is not copied into the temporary comparison page. Use Show In Explorer to inspect the document with a trusted application.",
+		}
+	}
+	return fallbackForRow(row)
 }
 
 func writeFallbackPreview(builder *strings.Builder, fallback previewFallback) {
@@ -1530,91 +1846,30 @@ func writeFallbackPreview(builder *strings.Builder, fallback previewFallback) {
 	builder.WriteString(`</div></div>`)
 }
 
-func pdfPreviewSnippet(path string) (snippet string, pages int, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			snippet = ""
-			pages = 0
-			err = fmt.Errorf("PDF preview parser failed: %v", recovered)
-		}
-	}()
-
-	file, reader, err := pdf.Open(path)
-	if file != nil {
-		defer file.Close()
-	}
-	if err != nil {
-		return "", 0, err
-	}
-
-	pages = reader.NumPage()
-	if pages == 0 {
-		return "", 0, nil
-	}
-
-	fonts := make(map[string]*pdf.Font)
-	pageLimit := pages
-	if pageLimit > 2 {
-		pageLimit = 2
-	}
-
-	var builder strings.Builder
-	for pageIndex := 1; pageIndex <= pageLimit; pageIndex++ {
-		page := reader.Page(pageIndex)
-		if page.V.IsNull() || page.V.Key("Contents").Kind() == pdf.Null {
-			continue
-		}
-		for _, name := range page.Fonts() {
-			if _, ok := fonts[name]; !ok {
-				font := page.Font(name)
-				fonts[name] = &font
-			}
-		}
-		text, err := page.GetPlainText(fonts)
-		if err != nil {
-			continue
-		}
-		builder.WriteString(text)
-		builder.WriteString(" ")
-		if builder.Len() > 600 {
-			break
-		}
-	}
-
-	return truncatePreviewText(builder.String(), 360), pages, nil
-}
-
-func truncatePreviewText(text string, limit int) string {
-	parts := strings.Fields(text)
-	if len(parts) == 0 {
-		return ""
-	}
-	normalized := strings.Join(parts, " ")
-	if len(normalized) <= limit {
-		return normalized
-	}
-	if limit <= 3 {
-		return normalized[:limit]
-	}
-	return normalized[:limit-3] + "..."
-}
-
-func buildComparisonPreviewPage(rows []duplicateRow, limit int) (string, int, error) {
+func buildComparisonPreviewPage(ctx context.Context, rows []duplicateRow, limit int, shellReady bool) (pagePath string, rendered int, tempDir string, err error) {
 	if limit <= 0 {
 		limit = maxComparisonPreviewFiles
 	}
-	rendered := len(rows)
+	rendered = len(rows)
 	if rendered > limit {
 		rendered = limit
 	}
 
-	dir := filepath.Join(os.TempDir(), "duplicate-file-finder-preview")
-	if err := os.RemoveAll(dir); err != nil {
-		return "", 0, err
+	if err := ctx.Err(); err != nil {
+		return "", 0, "", err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", 0, err
+	tempDir, err = os.MkdirTemp(os.TempDir(), "twintidy-preview-")
+	if err != nil {
+		return "", 0, "", err
 	}
+	keepArtifact := false
+	defer func() {
+		if !keepArtifact {
+			cleanupPreviewArtifact(tempDir)
+			pagePath = ""
+			tempDir = ""
+		}
+	}()
 
 	type card struct {
 		row       duplicateRow
@@ -1624,31 +1879,37 @@ func buildComparisonPreviewPage(rows []duplicateRow, limit int) (string, int, er
 
 	cards := make([]card, 0, rendered)
 	for i := 0; i < rendered; i++ {
+		if err := ctx.Err(); err != nil {
+			return "", 0, tempDir, err
+		}
 		row := rows[i]
 		item := card{row: row}
-		if thumb, err := shellThumbnailNRGBA(row.File.Path, 420); err == nil {
-			thumbPath := filepath.Join(dir, fmt.Sprintf("thumb-%02d.png", i+1))
-			file, createErr := os.Create(thumbPath)
-			if createErr == nil {
-				encodeErr := png.Encode(file, thumb)
-				closeErr := file.Close()
-				if encodeErr == nil && closeErr == nil {
-					item.thumbPath = thumbPath
-				} else if encodeErr != nil {
-					item.fallback = fallbackForRow(row)
+		if shellReady {
+			thumb, thumbnailErr := shellThumbnailForVerifiedRecord(row.File, 420)
+			if thumbnailErr == nil {
+				thumbPath := filepath.Join(tempDir, fmt.Sprintf("thumb-%02d.png", i+1))
+				file, createErr := os.OpenFile(thumbPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+				if createErr == nil {
+					encodeErr := png.Encode(file, thumb)
+					closeErr := file.Close()
+					if encodeErr == nil && closeErr == nil {
+						item.thumbPath = thumbPath
+					} else {
+						item.fallback = fallbackForComparisonRow(row)
+					}
 				} else {
-					item.fallback = fallbackForRow(row)
+					item.fallback = fallbackForComparisonRow(row)
 				}
 			} else {
-				item.fallback = fallbackForRow(row)
+				item.fallback = fallbackForComparisonRow(row)
 			}
 		} else {
-			item.fallback = fallbackForRow(row)
+			item.fallback = fallbackForComparisonRow(row)
 		}
 		cards = append(cards, item)
 	}
 
-	pagePath := filepath.Join(dir, "comparison.html")
+	pagePath = filepath.Join(tempDir, "comparison.html")
 	var builder strings.Builder
 	builder.WriteString(`<!doctype html><html><head><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta charset="utf-8"><style>
 body{margin:0;background:#f5f6f8;color:#1d1d1f;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",Arial,sans-serif;font-size:13px;}
@@ -1666,7 +1927,6 @@ body{margin:0;background:#f5f6f8;color:#1d1d1f;font-family:-apple-system,BlinkMa
 .name{font-weight:600;font-size:14px;line-height:18px;word-break:break-word;margin-bottom:6px;}
 .meta{color:#59606b;line-height:18px;word-break:break-word;}
 .warning{margin-top:8px;color:#8a4b00;}
-.path{margin-top:8px;color:#858b96;font-size:12px;word-break:break-all;}
 </style></head><body>`)
 
 	if len(rows) > rendered {
@@ -1683,13 +1943,13 @@ body{margin:0;background:#f5f6f8;color:#1d1d1f;font-family:-apple-system,BlinkMa
 		builder.WriteString(`<div class="card"><div class="thumb">`)
 		if item.thumbPath != "" {
 			builder.WriteString(`<img src="`)
-			builder.WriteString(html.EscapeString(fileURL(item.thumbPath)))
+			builder.WriteString(html.EscapeString(previewArtifactFileURL(item.thumbPath)))
 			builder.WriteString(`" alt="">`)
 		} else {
 			writeFallbackPreview(&builder, item.fallback)
 		}
 		builder.WriteString(`</div><div class="body"><div class="name">`)
-		builder.WriteString(html.EscapeString(filepath.Base(row.File.Path)))
+		builder.WriteString(html.EscapeString(displayFilesystemName(row.File.Path)))
 		builder.WriteString(`</div><div class="meta">`)
 		if row.Duplicate {
 			builder.WriteString(`Group `)
@@ -1700,7 +1960,7 @@ body{margin:0;background:#f5f6f8;color:#1d1d1f;font-family:-apple-system,BlinkMa
 		builder.WriteString(` &middot; `)
 		builder.WriteString(html.EscapeString(formatBytes(row.File.Size)))
 		builder.WriteString(` &middot; `)
-		builder.WriteString(html.EscapeString(fileType(row.File.Path)))
+		builder.WriteString(html.EscapeString(displayUntrustedText(fileType(row.File.Path))))
 		builder.WriteString(`<br>Modified: `)
 		builder.WriteString(html.EscapeString(formatTime(row.File.ModifiedAt)))
 		if row.Duplicate {
@@ -1712,18 +1972,20 @@ body{margin:0;background:#f5f6f8;color:#1d1d1f;font-family:-apple-system,BlinkMa
 			builder.WriteString(`<div class="warning">Large file: preview uses thumbnail and metadata only.</div>`)
 		}
 		if item.thumbPath == "" {
-			builder.WriteString(`<div class="warning">Fallback preview generated by the app. Use Rich Preview for a full document/media view.</div>`)
+			builder.WriteString(`<div class="warning">Fallback preview generated by the app. Use Show In Explorer to inspect the file with a trusted application.</div>`)
 		}
-		builder.WriteString(`<div class="path">`)
-		builder.WriteString(html.EscapeString(row.File.Path))
-		builder.WriteString(`</div></div></div>`)
+		builder.WriteString(`</div></div>`)
 	}
 	builder.WriteString(`</div></body></html>`)
 
-	if err := os.WriteFile(pagePath, []byte(builder.String()), 0o644); err != nil {
-		return "", 0, err
+	if err := ctx.Err(); err != nil {
+		return "", 0, tempDir, err
 	}
-	return pagePath, rendered, nil
+	if err := os.WriteFile(pagePath, []byte(builder.String()), 0o600); err != nil {
+		return "", 0, tempDir, err
+	}
+	keepArtifact = true
+	return pagePath, rendered, tempDir, nil
 }
 
 func comparisonSummary(rows []duplicateRow, rendered int) string {
@@ -1747,24 +2009,50 @@ func comparisonSummary(rows []duplicateRow, rendered int) string {
 	if len(rows) > rendered {
 		message += fmt.Sprintf("\r\n\r\nDisplay limit reached: only the first %d files are shown to keep the preview readable and responsive. Reduce the selection for a more detailed side-by-side comparison.", rendered)
 	}
-	message += "\r\n\r\nLarge files are shown with thumbnail, fallback preview, and metadata only. Files without Windows thumbnails use app-generated fallback cards with metadata and PDF text snippets when available."
+	message += "\r\n\r\nLarge files are shown with thumbnail, fallback preview, and metadata only. Absolute source paths and document text are not copied into the temporary comparison page."
 	return message
 }
 
-func failureSummary(failures []scanner.DeleteFailure) string {
-	var builder strings.Builder
-	limit := len(failures)
-	if limit > 8 {
-		limit = 8
+func recycleOutcomeSummary(outcome recycleOutcome) string {
+	status := fmt.Sprintf(
+		"Recycle complete: %d recycled; %d changed and kept; %d protected and kept; %d cancelled and kept; %d failed and kept; %d request error(s).",
+		outcome.recycled,
+		outcome.changed,
+		outcome.protected,
+		outcome.cancelled,
+		outcome.failed,
+		len(outcome.requestErrors),
+	)
+	if outcome.internalError != "" {
+		status += " An internal recycle workflow error was recorded."
 	}
-	for i := 0; i < limit; i++ {
-		builder.WriteString(failures[i].Path)
-		builder.WriteString(": ")
-		builder.WriteString(failures[i].Error)
+	return status
+}
+
+func recycleOutcomeHasIssues(outcome recycleOutcome) bool {
+	return outcome.changed > 0 || outcome.protected > 0 || outcome.cancelled > 0 || outcome.failed > 0 || len(outcome.requestErrors) > 0 || outcome.internalError != ""
+}
+
+func recycleIssueSummary(outcome recycleOutcome) string {
+	var builder strings.Builder
+	if outcome.internalError != "" {
+		builder.WriteString("Internal workflow error: ")
+		builder.WriteString(displayUntrustedText(outcome.internalError))
 		builder.WriteString("\r\n")
 	}
-	if len(failures) > limit {
-		builder.WriteString(fmt.Sprintf("...and %d more.", len(failures)-limit))
+	for _, requestError := range outcome.requestErrors {
+		builder.WriteString(displayUntrustedText(requestError))
+		builder.WriteString("\r\n")
+	}
+	for _, item := range outcome.nonRecycledRows {
+		builder.WriteString(displayFilesystemPath(item.Path))
+		builder.WriteString(": ")
+		builder.WriteString(retainedRecycleStatus(item.Status))
+		if item.Reason != "" {
+			builder.WriteString(" - ")
+			builder.WriteString(displayUntrustedText(item.Reason))
+		}
+		builder.WriteString("\r\n")
 	}
 	return builder.String()
 }

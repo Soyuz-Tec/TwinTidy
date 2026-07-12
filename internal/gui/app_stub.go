@@ -3,10 +3,11 @@
 package gui
 
 import (
-	"fmt"
-	"os"
+	"errors"
 )
 
-func Run() {
-	fmt.Fprintln(os.Stderr, "This build currently provides a Windows-native desktop GUI. Run it on Windows or add a platform GUI for this OS.")
-}
+var ErrUnsupportedPlatform = errors.New("TwinTidy provides a Windows-native desktop GUI and cannot run on this platform")
+
+func Run() error { return ErrUnsupportedPlatform }
+
+func SmokeTest() error { return ErrUnsupportedPlatform }

@@ -1,0 +1,82 @@
+name: Bug report
+description: Report reproducible TwinTidy behavior that is incorrect or unsafe.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve TwinTidy. Do not attach personal files, credentials, or unreviewed logs. Use the private security-reporting link for a vulnerability or possible data-loss exploit.
+
+  - type: input
+    id: version
+    attributes:
+      label: TwinTidy version
+      description: Use the About view or `TwinTidy.exe --version` when available.
+      placeholder: v0.1.0-beta.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Windows architecture
+      options:
+        - amd64 / x64
+        - ARM64
+        - Unknown
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2, build 26100
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What happened?
+      description: Describe the observed result and the result you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use disposable test files when the issue involves recycling or deletion.
+      placeholder: |
+        1. Create...
+        2. Scan...
+        3. Select...
+        4. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: storage
+    attributes:
+      label: Storage context
+      description: State whether this was a local NTFS folder, OneDrive/sync folder, network share, removable drive, junction, or other relevant setup. Do not disclose sensitive paths.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Reviewed diagnostics
+      description: Paste only the minimal relevant lines after removing personal paths or other sensitive data.
+      render: text
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I reproduced destructive behavior only with disposable files or backups.
+          required: true
+        - label: I reviewed the information above for personal paths, file contents, and secrets.
+          required: true

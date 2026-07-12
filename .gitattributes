@@ -1,6 +1,16 @@
 * text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
 *.go text eol=lf
 *.mod text eol=lf
 *.sum text eol=lf
 *.md text eol=lf
 *.manifest text eol=lf
+*.ps1 text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.png binary
+*.syso binary
+*.zip binary

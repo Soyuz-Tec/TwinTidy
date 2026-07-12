@@ -9,7 +9,6 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/lxn/walk"
 	"github.com/lxn/win"
 )
 
@@ -20,7 +19,12 @@ const (
 var (
 	shell32                         = syscall.NewLazyDLL("shell32.dll")
 	procSHCreateItemFromParsingName = shell32.NewProc("SHCreateItemFromParsingName")
-	iidIShellItemImageFactory       = win.IID{0xbcc18b79, 0xba16, 0x442f, [8]byte{0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b}}
+	iidIShellItemImageFactory       = win.IID{
+		Data1: 0xbcc18b79,
+		Data2: 0xba16,
+		Data3: 0x442f,
+		Data4: [8]byte{0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b},
+	}
 )
 
 type shellItemImageFactory struct {
@@ -55,15 +59,10 @@ func (f *shellItemImageFactory) getImage(size win.SIZE, flags uint32, hbm *win.H
 	return win.HRESULT(ret)
 }
 
-func shellThumbnailImage(path string, maxSize int, dpi int) (walk.Image, error) {
-	img, err := shellThumbnailNRGBA(path, maxSize)
-	if err != nil {
-		return nil, err
-	}
-	return walk.NewBitmapFromImageForDPI(img, dpi)
-}
-
-func shellThumbnailNRGBA(path string, maxSize int) (*image.NRGBA, error) {
+// shellThumbnailNRGBAFromHeldRecordPath is the raw path-based Shell boundary.
+// Its caller must hold a verified no-write/no-delete-share record handle for
+// the entire call and revalidate the record scope afterward.
+func shellThumbnailNRGBAFromHeldRecordPath(path string, maxSize int) (*image.NRGBA, error) {
 	pathPtr, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
