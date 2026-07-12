@@ -29,11 +29,33 @@ const (
 )
 
 type FileRecord struct {
-	Path       string
-	Size       int64
-	CreatedAt  time.Time
-	ModifiedAt time.Time
-	Category   FileCategory
+	Path         string
+	Size         int64
+	CreatedAt    time.Time
+	ModifiedAt   time.Time
+	Category     FileCategory
+	Identity     FileIdentity
+	LinkCount    uint32
+	NamedStreams uint32
+	Scope        AuthorizedScope
+}
+
+// FileIdentity identifies one physical file on a Windows machine. A file ID is
+// meaningful only together with the volume serial number that issued it.
+type FileIdentity struct {
+	VolumeSerial uint64
+	FileID       [16]byte
+}
+
+// AuthorizedScope binds a scan record to the selected root that authorized
+// its discovery. The value is deliberately comparable and copy-safe so later
+// preview and recycle requests can bind user intent to the same scope.
+// RootFinalPath is the canonical final path observed from an open root handle;
+// RootIdentity detects replacement of that filesystem object.
+type AuthorizedScope struct {
+	RootFinalPath string
+	RootIdentity  FileIdentity
+	RootIsFile    bool
 }
 
 type DuplicateGroup struct {
@@ -61,6 +83,15 @@ type ScanOptions struct {
 	UserFilesOnly bool
 }
 
+// ScanLimits cap the in-memory inventory built during one scan. Zero values
+// select production defaults. Callers should normally use NewEngine; explicit
+// limits primarily support controlled deployments and deterministic tests.
+type ScanLimits struct {
+	MaxRoots       int
+	MaxDirectories int64
+	MaxFiles       int64
+}
+
 type FileCategoryDefinition struct {
 	Category   FileCategory
 	Label      string
@@ -82,24 +113,28 @@ type SurfaceReport struct {
 	SkippedSystemItems int64
 }
 
-type DeleteAction string
+type RecycleRequest struct {
+	Group    DuplicateGroup
+	Selected []FileRecord
+}
+
+type RecycleStatus string
 
 const (
-	DeleteActionTrash     DeleteAction = "trash"
-	DeleteActionPermanent DeleteAction = "permanent"
+	RecycleStatusRecycled         RecycleStatus = "recycled"
+	RecycleStatusSkippedChanged   RecycleStatus = "skipped-changed"
+	RecycleStatusSkippedProtected RecycleStatus = "skipped-protected"
+	RecycleStatusCancelled        RecycleStatus = "cancelled"
+	RecycleStatusFailed           RecycleStatus = "failed"
 )
 
-type DeletedFile struct {
+type RecycleItemResult struct {
 	Path   string
-	Action DeleteAction
+	Status RecycleStatus
+	Reason string
 }
 
-type DeleteFailure struct {
-	Path  string
-	Error string
-}
-
-type DeleteResult struct {
-	Deleted []DeletedFile
-	Failed  []DeleteFailure
+type RecycleResult struct {
+	Items        []RecycleItemResult
+	RequestError string
 }

@@ -1,99 +1,123 @@
-# Duplicate File Finder Go
+# TwinTidy
 
-High-performance Windows desktop duplicate finder written in Go. The scanner uses a three-stage pipeline:
+TwinTidy is a local, Windows-native duplicate-file review tool being hardened toward safe cleanup. It proves that files are byte-for-byte identical and lets you review which copies could be kept. Destructive cleanup is intentionally disabled in the current pre-release build because Windows' documented Shell recycle API cannot keep the action bound to the verified file identity.
 
-1. Group files by exact byte size.
-2. Compare first and last 4KB with a 64-bit xxHash boundary hash.
-3. Stream full SHA-256 hashes through a pooled 64KB buffer for exact-match confirmation.
+It is designed around one rule: finding a duplicate is useful, but avoiding data loss is more important.
 
-The GUI uses a Windows-native Go toolkit, so it does not require `gcc`, MSYS2, GTK, or CGO/OpenGL setup. It provides folder selection, live progress, grouped duplicate results, an Explorer-style visual preview pane, text previews for text-like files, keep-newest/keep-oldest selection, and trash-first deletion.
+## What it does
 
-## Visual Design
+TwinTidy uses a staged scan so expensive work is reserved for plausible matches:
 
-The GUI uses a macOS-inspired, Liquid Glass-adjacent theme adapted to the Windows-native toolkit. It applies layered neutral surfaces, compact toolbar grouping, subdued secondary text, Apple-style accent colors, and cleaner preview cards while preserving native Windows accessibility, keyboard behavior, and file dialogs.
+1. Surface-scan eligible user files and record current Windows file identities.
+2. Group candidates by exact byte size.
+3. Compare the first and last 4 KiB with xxHash.
+4. Stream the remaining candidates through SHA-256 for exact-match proof.
 
-## Scan Workflow
+The desktop workflow includes:
 
-The app uses a two-step workflow:
+- native Windows folder selection and progress reporting
+- PDF, text, Word, Excel, PowerPoint, image, audio, video, archive, and `Other` focus filters
+- grouped duplicate results with keep-newest and keep-oldest helpers
+- checkbox-only cleanup planning; highlighting a row never means “remove it”
+- Windows Shell thumbnails, local rich previews, and metadata fallback cards
+- fail-closed cleanup capability gating; the current build never changes files
+- local session diagnostics with no telemetry
 
-1. `Surface Scan` reads metadata for user-created files only. It skips system folders, application folders, dependency folders, executable/installable files, and protected OS locations.
-2. After the surface scan, the `File Focus` switches become active. Select the file types to inspect, then click `Find Duplicates`.
+TwinTidy finds exact duplicates by content, not merely by name or extension. A supported file whose extension is not in a named focus category can still be considered under `Other`.
 
-Supported focus switches include PDF, Text, Word, Excel, PowerPoint, Images, Audio, Video, Archives, and Other. Each switch shows the number of eligible files found during the surface scan.
+## Safety model
 
-After a surface scan, the results table shows all eligible user-created files with `Scanned` status. If a duplicate scan finds no exact duplicates, the table remains populated with the selected focus files marked `No duplicate`, so users can still preview files, inspect metadata, and open file locations.
+A scan result is only a point-in-time observation. Before any future recycle action, TwinTidy must reopen the target and a distinct unselected keeper and revalidate their Windows file identities, sizes, timestamps, protection state, and complete SHA-256 content.
 
-The scanner is intentionally conservative. It avoids files under locations such as Windows, Program Files, ProgramData, AppData, Recycle Bin, System Volume Information, `.git`, `node_modules`, cache folders, virtual environments, build folders, and executable or installer file types such as `.exe`, `.dll`, `.sys`, `.msi`, `.appx`, and `.msix`.
+The current production adapter stops before any destructive native call. Windows `IFileOperation` consumes a path-derived Shell item rather than the verified file handle, so another process could replace the path occupant after verification. Cleanup will remain unavailable until an identity-bound, reversible adapter satisfies [ADR 0005](docs/adr/0005-disable-path-based-recycle.md).
 
-## Folder Selection
+Any future cleanup must fail closed:
 
-The `Select Folder` button uses the modern Windows folder picker through `IFileOpenDialog` in folder mode. It shows the normal Explorer-style folder browser with breadcrumb navigation, left navigation, search, recent locations, OneDrive, network locations, and the standard Windows access model. If the modern picker is unavailable on a machine, the app falls back to the legacy folder picker instead of blocking the scan workflow.
+- every selected file must still belong to its scanned duplicate group
+- at least one separately identified, verified keeper must remain
+- changed, replaced, missing, hard-linked, reparse-backed, or alternate-stream files are not recycled
+- native cancellation, ambiguous outcomes, and access failures are reported as failures
+- success is shown only after Windows reports success and the original source object is no longer present at that path
+- there is no automatic permanent-delete fallback
 
-## Diagnostics And Crash Reports
+See [Security model](docs/SECURITY_MODEL.md), [Architecture](docs/ARCHITECTURE.md), and [ADR 0002](docs/adr/0002-verified-recycle-safety.md) for the full contract.
 
-Each app run writes a session log to:
+## Privacy
+
+Scanning, hashing, previews, and cleanup planning run locally under the current Windows account. TwinTidy has no account, cloud service, analytics SDK, advertising, or automatic file upload. It does not require administrator privileges for ordinary use.
+
+Diagnostics are stored under:
 
 ```text
-%LOCALAPPDATA%\DuplicateFileFinder\logs
+%LOCALAPPDATA%\TwinTidy\logs
 ```
 
-The app also writes a `crash-*.txt` report if an unexpected panic occurs. Crash reports include the failure scope, panic message, Go runtime version, OS/architecture, executable path, working directory, session log path, command-line arguments, relevant workflow fields, and a stack trace. They do not dump environment variables or file contents.
+Logs remain on the computer unless the user explicitly shares them. Review diagnostic files before attaching them to a report because local filesystem context can be sensitive.
 
-Use the `Open Logs` button in the top toolbar to open the log folder in File Explorer. When reporting an incident, include the latest `session-*.log` and any matching `crash-*.txt` file from the same time.
+## Supported platform
 
-## Preview Support
+Production targets are:
 
-The preview pane now has two layers:
+| Operating system | Architecture | Artifact |
+|---|---:|---|
+| Windows | x64 / `amd64` | `TwinTidy-windows-amd64.zip` |
+| Windows | ARM64 | `TwinTidy-windows-arm64.zip` |
 
-- Explorer-style thumbnail preview through Windows Shell thumbnail providers. This covers common images and can also cover PDFs, Office files, audio album art, and video frames when Windows has a thumbnail provider installed.
-- Embedded Rich Preview through the local Windows browser control. PDF, Word, Excel, PowerPoint, audio, and video formats automatically open in Rich Preview when their row is selected. The `Rich Preview` button remains available to reload that mode manually. Rendering depends on Windows, Office/PDF/media handlers, and local browser support.
-- App-generated fallback preview. If Windows does not return a thumbnail, the app now shows a clean file-type card instead of an error. PDF cards include page count and a short extracted text snippet when the document allows it. Office, audio, video, image, and unknown file types show type-specific metadata guidance.
-- Multi-file comparison preview. Select multiple rows in the results table to show a responsive preview grid in the preview pane. The grid wraps as the app window is resized and uses thumbnails or fallback cards per file. To keep the UI readable, the pane shows the first 12 selected files and displays a limit message when more files are selected.
+Windows `386` is not supported. Release binaries use `CGO_ENABLED=0`; the shipped application does not need Python, GCC, MSYS2, GTK, Electron, a browser server, or a background service.
 
-If a file type cannot be rendered visually, the app still shows exact-hash verification details and lets you open the file location with `Show In Explorer`.
+The scanner intentionally uses CPU and storage concurrency rather than requiring a GPU. Exact duplicate detection is generally storage-bound; future similarity analysis can add optional acceleration without weakening deterministic CPU fallback.
 
-## Windows Prerequisites
+## Build from source
 
-Install Go. No C compiler is required.
+Requirements:
 
-The package embeds a Windows Common Controls v6 manifest in `cmd/dupfind/rsrc_windows_amd64.syso`. This is required by the native GUI toolkit and prevents startup failures such as `TTM_ADDTOOL failed`.
+- the Go patch version declared in `go.mod`
+- Windows PowerShell 5.1 or PowerShell 7+
+- Windows for native GUI execution
 
-Verify:
+Run the quality gates:
 
 ```powershell
-go version
+git clone https://github.com/Soyuz-Tec/duplicate-file-finder-go.git
+Set-Location duplicate-file-finder-go
+$env:CGO_ENABLED = "0"
+go mod verify
+go vet ./...
+go test ./... -count=1
 ```
 
-## Run From Source
+Run from source:
 
 ```powershell
-cd "C:\Users\vasan\OneDrive\Documents\duplicate-file-finder-go"
-go run ./cmd/dupfind
+go run ./cmd/twintidy
 ```
 
-## Build an EXE
+Build one architecture:
 
 ```powershell
-cd "C:\Users\vasan\OneDrive\Documents\duplicate-file-finder-go"
-go build -o DuplicateFileFinder.exe ./cmd/dupfind
-.\DuplicateFileFinder.exe
+./scripts/build.ps1 -Architecture amd64 -Version dev
 ```
 
-For a double-clickable app without a console window:
+Generate both architecture-specific Windows resource objects:
 
 ```powershell
-go build -ldflags="-H windowsgui" -o DuplicateFileFinder.exe ./cmd/dupfind
+./scripts/generate-resources.ps1 -Architecture all
 ```
 
-## Test
+Resource generation uses the pinned pure-Go `go-winres` tool. Generated `.syso` files contain the Common Controls v6/PerMonitorV2 manifest, TwinTidy icon, and PE version information.
+
+## Release verification
+
+Build exact-commit portable packages and run the source, receipt, reproducibility, and resource checks from a clean tree:
 
 ```powershell
-go test ./...
+./scripts/verify-release.ps1 -Version 0.1.0-beta.1
 ```
 
-## Safety Notes
+Direct development builds remain available from a dirty working tree and are labeled with their source digest. Stable public artifacts require the signing, native x64/ARM64 smoke, checksum, receipt, and provenance gates described in [Release engineering](docs/RELEASE.md). An unsigned local build is a development artifact, not an official TwinTidy release.
 
-- The scanner skips symlinks to avoid directory loops and dead-link failures.
-- Locked, unreadable, or permission-denied files are counted and ignored instead of crashing the scan.
-- Files are never loaded fully into RAM during hashing.
-- Deletion tries the OS trash/recycle bin first, then falls back to permanent delete only when requested by the GUI confirmation path.
+## Development status
+
+TwinTidy is being hardened toward its first reviewed release. The current pre-release build supports scanning, exact-match verification, selection planning, and previews; cleanup is disabled and no stable release may enable it without the identity-safety evidence required by ADR 0005.
+
+Security or possible data-loss reports should be submitted through [GitHub private vulnerability reporting](https://github.com/Soyuz-Tec/duplicate-file-finder-go/security/advisories/new), not a public issue.

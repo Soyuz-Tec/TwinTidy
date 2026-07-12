@@ -16,32 +16,72 @@ import (
 	"sync/atomic"
 	"time"
 
-	"duplicate-file-finder-go/internal/diagnostics"
+	"github.com/Soyuz-Tec/duplicate-file-finder-go/internal/diagnostics"
 
 	"github.com/cespare/xxhash/v2"
-	"github.com/karrick/godirwalk"
 )
 
 const (
-	boundaryReadSize   = 4 * 1024
-	fullHashBufferSize = 64 * 1024
+	boundaryReadSize          = 4 * 1024
+	fullHashBufferSize        = 64 * 1024
+	directoryReadBatchSize    = 256
+	maxScanWorkers            = 64
+	defaultMaxScanRoots       = 256
+	defaultMaxScanDirectories = 250_000
+	defaultMaxScanFiles       = 500_000
 )
+
+// ErrScanLimitExceeded identifies an intentional cardinality stop. Its error
+// text tells the user which boundary was reached and how to narrow the scan.
+var ErrScanLimitExceeded = errors.New("scan cardinality limit exceeded")
+
+type scanLimitError struct {
+	kind  string
+	limit int64
+}
+
+func (e *scanLimitError) Error() string {
+	return fmt.Sprintf("%s: reached the configured maximum of %d %s(s); select fewer or smaller folders and scan again", ErrScanLimitExceeded, e.limit, e.kind)
+}
+
+func (e *scanLimitError) Unwrap() error { return ErrScanLimitExceeded }
 
 type Engine struct {
 	workers int
+	limits  ScanLimits
 	bufPool sync.Pool
 }
 
 func NewEngine(workers int) *Engine {
+	return NewEngineWithLimits(workers, DefaultScanLimits())
+}
+
+// DefaultScanLimits returns production-safe inventory bounds. The limits are
+// intentionally generous enough for whole-profile scans while preventing an
+// attacker-controlled directory tree from growing memory without bound.
+func DefaultScanLimits() ScanLimits {
+	return ScanLimits{
+		MaxRoots:       defaultMaxScanRoots,
+		MaxDirectories: defaultMaxScanDirectories,
+		MaxFiles:       defaultMaxScanFiles,
+	}
+}
+
+func NewEngineWithLimits(workers int, limits ScanLimits) *Engine {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
 	if workers < 1 {
 		workers = 1
 	}
+	if workers > maxScanWorkers {
+		workers = maxScanWorkers
+	}
+	limits = normalizeScanLimits(limits)
 
 	return &Engine{
 		workers: workers,
+		limits:  limits,
 		bufPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, fullHashBufferSize)
@@ -49,6 +89,20 @@ func NewEngine(workers int) *Engine {
 			},
 		},
 	}
+}
+
+func normalizeScanLimits(limits ScanLimits) ScanLimits {
+	defaults := DefaultScanLimits()
+	if limits.MaxRoots <= 0 {
+		limits.MaxRoots = defaults.MaxRoots
+	}
+	if limits.MaxDirectories <= 0 {
+		limits.MaxDirectories = defaults.MaxDirectories
+	}
+	if limits.MaxFiles <= 0 {
+		limits.MaxFiles = defaults.MaxFiles
+	}
+	return limits
 }
 
 func (e *Engine) Workers() int {
@@ -68,20 +122,66 @@ func (e *Engine) ScanWithOptions(ctx context.Context, roots []string, options Sc
 }
 
 func (e *Engine) ScanFiles(ctx context.Context, files []FileRecord, options ScanOptions, updates chan<- Progress) ([]DuplicateGroup, error) {
+	if int64(len(files)) > e.limits.MaxFiles {
+		return nil, &scanLimitError{kind: "file", limit: e.limits.MaxFiles}
+	}
+	for _, file := range files {
+		if !scopeIsValid(file.Scope) {
+			return nil, fmt.Errorf("cannot scan unscoped record %q: %w", file.Path, errMissingScope)
+		}
+	}
 	options = NormalizeScanOptions(options)
 	filtered := filterRecordsByOptions(files, options)
-	if len(filtered) == 0 {
+	startedAt := time.Now()
+	refreshed, errorsIgnored, err := e.refreshRecords(ctx, filtered, updates, startedAt)
+	if err != nil {
+		return nil, err
+	}
+	if len(refreshed) == 0 {
 		sendProgress(updates, Progress{
-			Stage:     StageDone,
-			StartedAt: time.Now(),
-			Message:   "No files matched the selected user-file categories.",
+			Stage:         StageDone,
+			ErrorsIgnored: errorsIgnored,
+			StartedAt:     startedAt,
+			Message:       "No stable, supported files matched the selected user-file categories.",
 		})
 		return nil, nil
 	}
 
-	startedAt := time.Now()
-	sizeGroups := sizeGroupsFromRecords(filtered)
-	return e.scanSizeGroups(ctx, sizeGroups, 0, updates, startedAt)
+	sizeGroups := sizeGroupsFromRecords(refreshed)
+	return e.scanSizeGroups(ctx, sizeGroups, errorsIgnored, updates, startedAt)
+}
+
+func (e *Engine) refreshRecords(ctx context.Context, files []FileRecord, updates chan<- Progress, startedAt time.Time) ([]FileRecord, int64, error) {
+	refreshed := make([]FileRecord, 0, len(files))
+	var errorsIgnored int64
+	for index, file := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, errorsIgnored, err
+		}
+
+		current, err := refreshFileRecord(file)
+		if err != nil {
+			if errors.Is(err, errRootChanged) || errors.Is(err, errMissingScope) {
+				return nil, errorsIgnored, err
+			}
+			errorsIgnored++
+			continue
+		}
+		refreshed = append(refreshed, current)
+
+		if (index+1)%128 == 0 {
+			sendProgress(updates, Progress{
+				Stage:          StageSizeMapping,
+				CurrentPath:    current.Path,
+				FilesProcessed: int64(index + 1),
+				FilesTotal:     int64(len(files)),
+				ErrorsIgnored:  errorsIgnored,
+				StartedAt:      startedAt,
+				Message:        "Refreshing current file metadata and identity.",
+			})
+		}
+	}
+	return refreshed, errorsIgnored, nil
 }
 
 func (e *Engine) scanSizeGroups(ctx context.Context, sizeGroups map[int64][]FileRecord, errorsIgnored int64, updates chan<- Progress, startedAt time.Time) ([]DuplicateGroup, error) {
@@ -164,14 +264,20 @@ func (e *Engine) SurfaceScan(ctx context.Context, roots []string, updates chan<-
 }
 
 func (e *Engine) collectSurfaceRecords(ctx context.Context, roots []string, updates chan<- Progress, startedAt time.Time) (SurfaceReport, error) {
+	if len(roots) > e.limits.MaxRoots {
+		return SurfaceReport{}, &scanLimitError{kind: "root", limit: int64(e.limits.MaxRoots)}
+	}
+	scanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var (
 		mu                 sync.Mutex
-		filesProcessed     int64
 		totalBytes         int64
 		directoriesScanned int64
 		errorsIgnored      int64
 		skippedSystemItems int64
 	)
+	budget := scanBudget{limits: e.limits}
 
 	report := SurfaceReport{
 		Files:         make([]FileRecord, 0),
@@ -181,25 +287,42 @@ func (e *Engine) collectSurfaceRecords(ctx context.Context, roots []string, upda
 		report.CategoryStats[definition.Category] = SurfaceCategoryStats{}
 	}
 
-	rootDirs := make([]string, 0, len(roots))
-	seenRoots := make(map[string]struct{}, len(roots))
+	rootDirs := make([]directoryWork, 0, len(roots))
+	rootScopes := make([]AuthorizedScope, 0, len(roots))
+	seenRoots := make(map[FileIdentity]struct{}, len(roots))
 
-	recordFile := func(path string, info os.FileInfo) {
-		if !info.Mode().IsRegular() {
-			return
+	recordFile := func(path string, scope AuthorizedScope) error {
+		if err := scanCtx.Err(); err != nil {
+			return err
 		}
 		if !IsUserCreatedFilePath(path) {
 			atomic.AddInt64(&skippedSystemItems, 1)
-			return
+			return nil
 		}
 
-		category := CategoryForPath(path)
+		file, snapshot, finalPath, err := openSurfaceFileSnapshot(path, scope)
+		if err != nil {
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		processed, err := budget.reserveFile()
+		if err != nil {
+			return err
+		}
+
+		category := CategoryForPath(finalPath)
 		record := FileRecord{
-			Path:       path,
-			Size:       info.Size(),
-			CreatedAt:  bestEffortCreatedAt(path, info.ModTime()),
-			ModifiedAt: info.ModTime(),
-			Category:   category,
+			Path:         finalPath,
+			Size:         snapshot.size,
+			CreatedAt:    bestEffortCreatedAt(finalPath, snapshot.modifiedAt),
+			ModifiedAt:   snapshot.modifiedAt,
+			Category:     category,
+			Identity:     snapshot.identity,
+			LinkCount:    snapshot.linkCount,
+			NamedStreams: snapshot.namedStreams,
+			Scope:        scope,
 		}
 
 		mu.Lock()
@@ -210,12 +333,11 @@ func (e *Engine) collectSurfaceRecords(ctx context.Context, roots []string, upda
 		report.CategoryStats[category] = stats
 		mu.Unlock()
 
-		processed := atomic.AddInt64(&filesProcessed, 1)
 		atomic.AddInt64(&totalBytes, record.Size)
 		if processed%128 == 0 {
 			sendProgress(updates, Progress{
 				Stage:              StageSurfaceScan,
-				CurrentPath:        path,
+				CurrentPath:        finalPath,
 				FilesProcessed:     processed,
 				DirectoriesScanned: atomic.LoadInt64(&directoriesScanned),
 				ErrorsIgnored:      atomic.LoadInt64(&errorsIgnored),
@@ -224,38 +346,61 @@ func (e *Engine) collectSurfaceRecords(ctx context.Context, roots []string, upda
 				Message:            "Reading user file metadata.",
 			})
 		}
+		return nil
 	}
 
 	for _, root := range roots {
+		if err := scanCtx.Err(); err != nil {
+			return SurfaceReport{}, err
+		}
 		absRoot, err := filepath.Abs(root)
 		if err != nil {
 			atomic.AddInt64(&errorsIgnored, 1)
 			continue
 		}
 		absRoot = filepath.Clean(absRoot)
-		if _, seen := seenRoots[absRoot]; seen {
-			continue
-		}
-		seenRoots[absRoot] = struct{}{}
-
 		if ShouldSkipDirectory(absRoot) {
 			atomic.AddInt64(&skippedSystemItems, 1)
 			continue
 		}
 
-		info, err := os.Stat(absRoot)
+		scope, info, err := authorizeScanRoot(absRoot)
 		if err != nil {
+			if errors.Is(err, errReparsePoint) {
+				return SurfaceReport{}, fmt.Errorf("unsafe scan root %q: %w", root, err)
+			}
 			atomic.AddInt64(&errorsIgnored, 1)
 			continue
 		}
-		if info.IsDir() {
-			rootDirs = append(rootDirs, absRoot)
+		if ShouldSkipDirectory(scope.RootFinalPath) {
+			atomic.AddInt64(&skippedSystemItems, 1)
 			continue
 		}
-		recordFile(absRoot, info)
+		if _, seen := seenRoots[scope.RootIdentity]; seen {
+			continue
+		}
+		seenRoots[scope.RootIdentity] = struct{}{}
+		rootScopes = append(rootScopes, scope)
+		if info.IsDir() {
+			if _, err := budget.reserveDirectory(); err != nil {
+				return SurfaceReport{}, err
+			}
+			rootDirs = append(rootDirs, directoryWork{path: scope.RootFinalPath, scope: scope})
+			continue
+		}
+		if err := recordFile(scope.RootFinalPath, scope); err != nil {
+			if errors.Is(err, ErrScanLimitExceeded) || errors.Is(err, errRootChanged) || errors.Is(err, errMissingScope) {
+				return SurfaceReport{}, err
+			}
+			if errors.Is(err, errReparsePoint) || errors.Is(err, errScopeEscape) {
+				atomic.AddInt64(&skippedSystemItems, 1)
+			} else {
+				atomic.AddInt64(&errorsIgnored, 1)
+			}
+		}
 	}
 
-	if len(rootDirs) == 0 && atomic.LoadInt64(&filesProcessed) == 0 {
+	if len(rootDirs) == 0 && atomic.LoadInt64(&budget.files) == 0 {
 		return SurfaceReport{}, errors.New("no readable user-created files were found")
 	}
 
@@ -264,26 +409,41 @@ func (e *Engine) collectSurfaceRecords(ctx context.Context, roots []string, upda
 	go func() {
 		defer diagnostics.ReportPanicAndRepanic("scanner directory queue watcher", map[string]string{"roots": fmt.Sprint(len(rootDirs))})
 		select {
-		case <-ctx.Done():
+		case <-scanCtx.Done():
 			queue.close()
 		case <-queueWatcherDone:
 		}
 	}()
 
 	var wg sync.WaitGroup
+	var scanErr error
+	var failOnce sync.Once
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		failOnce.Do(func() {
+			scanErr = err
+			cancel()
+			queue.close()
+		})
+	}
 	for i := 0; i < e.workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			defer diagnostics.ReportPanicAndRepanic("scanner size mapping worker", map[string]string{"worker": fmt.Sprint(workerID)})
-			scratch := make([]byte, godirwalk.MinimumScratchBufferSize)
 			for {
-				dir, ok := queue.next()
+				work, ok := queue.next()
 				if !ok {
 					return
 				}
-				e.readDirectory(ctx, dir, scratch, queue, recordFile, &directoriesScanned, &errorsIgnored, &skippedSystemItems, updates, startedAt)
+				err := e.readDirectory(scanCtx, work, queue, &budget, recordFile, &directoriesScanned, &errorsIgnored, &skippedSystemItems, updates, startedAt)
 				queue.done()
+				if err != nil {
+					fail(err)
+					return
+				}
 			}
 		}(i)
 	}
@@ -293,10 +453,18 @@ func (e *Engine) collectSurfaceRecords(ctx context.Context, roots []string, upda
 	if err := ctx.Err(); err != nil {
 		return SurfaceReport{}, err
 	}
+	if scanErr != nil {
+		return SurfaceReport{}, scanErr
+	}
+	for _, scope := range rootScopes {
+		if err := validateAuthorizedScope(scope); err != nil {
+			return SurfaceReport{}, err
+		}
+	}
 
 	sendProgress(updates, Progress{
 		Stage:              StageSurfaceScan,
-		FilesProcessed:     atomic.LoadInt64(&filesProcessed),
+		FilesProcessed:     atomic.LoadInt64(&budget.files),
 		DirectoriesScanned: atomic.LoadInt64(&directoriesScanned),
 		ErrorsIgnored:      atomic.LoadInt64(&errorsIgnored),
 		SkippedSystemItems: atomic.LoadInt64(&skippedSystemItems),
@@ -304,7 +472,7 @@ func (e *Engine) collectSurfaceRecords(ctx context.Context, roots []string, upda
 		Message:            "Finished reading user-created files.",
 	})
 
-	report.TotalFiles = atomic.LoadInt64(&filesProcessed)
+	report.TotalFiles = atomic.LoadInt64(&budget.files)
 	report.TotalBytes = atomic.LoadInt64(&totalBytes)
 	report.DirectoriesScanned = atomic.LoadInt64(&directoriesScanned)
 	report.ErrorsIgnored = atomic.LoadInt64(&errorsIgnored)
@@ -314,23 +482,36 @@ func (e *Engine) collectSurfaceRecords(ctx context.Context, roots []string, upda
 
 func (e *Engine) readDirectory(
 	ctx context.Context,
-	dir string,
-	scratch []byte,
+	work directoryWork,
 	queue *directoryQueue,
-	recordFile func(string, os.FileInfo),
+	budget *scanBudget,
+	recordFile func(string, AuthorizedScope) error,
 	directoriesScanned *int64,
 	errorsIgnored *int64,
 	skippedSystemItems *int64,
 	updates chan<- Progress,
 	startedAt time.Time,
-) {
+) error {
 	if ctx.Err() != nil {
-		return
+		return ctx.Err()
 	}
+	directory, finalDir, err := openDirectoryInScope(work.path, work.scope)
+	if err != nil {
+		if errors.Is(err, errRootChanged) || errors.Is(err, errMissingScope) {
+			return err
+		}
+		if errors.Is(err, errReparsePoint) || errors.Is(err, errScopeEscape) {
+			atomic.AddInt64(skippedSystemItems, 1)
+		} else {
+			atomic.AddInt64(errorsIgnored, 1)
+		}
+		return nil
+	}
+	defer directory.Close()
 
 	sendProgress(updates, Progress{
 		Stage:              StageSurfaceScan,
-		CurrentPath:        dir,
+		CurrentPath:        finalDir,
 		DirectoriesScanned: atomic.LoadInt64(directoriesScanned),
 		ErrorsIgnored:      atomic.LoadInt64(errorsIgnored),
 		SkippedSystemItems: atomic.LoadInt64(skippedSystemItems),
@@ -338,40 +519,106 @@ func (e *Engine) readDirectory(
 		Message:            "Scanning directory.",
 	})
 
-	entries, err := godirwalk.ReadDirents(dir, scratch)
-	if err != nil {
-		atomic.AddInt64(errorsIgnored, 1)
-		return
-	}
 	atomic.AddInt64(directoriesScanned, 1)
 
-	for _, entry := range entries {
-		if ctx.Err() != nil {
-			return
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-
-		path := filepath.Join(dir, entry.Name())
-		if entry.IsSymlink() {
-			continue
-		}
-		if entry.IsDir() {
-			if ShouldSkipDirectory(path) {
+		entries, readErr := directory.Readdir(directoryReadBatchSize)
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			name := entry.Name()
+			if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
 				atomic.AddInt64(skippedSystemItems, 1)
 				continue
 			}
-			queue.add(path)
-			continue
-		}
-		if !entry.IsRegular() {
-			continue
-		}
 
-		info, err := os.Stat(path)
-		if err != nil {
-			atomic.AddInt64(errorsIgnored, 1)
-			continue
+			path := filepath.Join(finalDir, name)
+			reparse, err := pathIsTraversalReparsePoint(path)
+			if err != nil {
+				atomic.AddInt64(errorsIgnored, 1)
+				continue
+			}
+			if reparse || entry.Mode()&os.ModeSymlink != 0 {
+				atomic.AddInt64(skippedSystemItems, 1)
+				continue
+			}
+			if entry.IsDir() {
+				if ShouldSkipDirectory(path) {
+					atomic.AddInt64(skippedSystemItems, 1)
+					continue
+				}
+				if _, err := budget.reserveDirectory(); err != nil {
+					return err
+				}
+				if !queue.add(directoryWork{path: path, scope: work.scope}) {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					return errors.New("directory queue closed before scan completed")
+				}
+				continue
+			}
+			if !entry.Mode().IsRegular() {
+				continue
+			}
+
+			if err := recordFile(path, work.scope); err != nil {
+				if errors.Is(err, ErrScanLimitExceeded) || errors.Is(err, errRootChanged) || errors.Is(err, errMissingScope) {
+					return err
+				}
+				if errors.Is(err, errReparsePoint) || errors.Is(err, errScopeEscape) {
+					atomic.AddInt64(skippedSystemItems, 1)
+				} else {
+					atomic.AddInt64(errorsIgnored, 1)
+				}
+			}
 		}
-		recordFile(path, info)
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		}
+		if readErr != nil {
+			atomic.AddInt64(errorsIgnored, 1)
+			return nil
+		}
+		if len(entries) == 0 {
+			atomic.AddInt64(errorsIgnored, 1)
+			return nil
+		}
+	}
+}
+
+type directoryWork struct {
+	path  string
+	scope AuthorizedScope
+}
+
+type scanBudget struct {
+	limits      ScanLimits
+	files       int64
+	directories int64
+}
+
+func (b *scanBudget) reserveFile() (int64, error) {
+	return reserveCardinality(&b.files, b.limits.MaxFiles, "file")
+}
+
+func (b *scanBudget) reserveDirectory() (int64, error) {
+	return reserveCardinality(&b.directories, b.limits.MaxDirectories, "directory")
+}
+
+func reserveCardinality(counter *int64, limit int64, kind string) (int64, error) {
+	for {
+		current := atomic.LoadInt64(counter)
+		if current >= limit {
+			return current, &scanLimitError{kind: kind, limit: limit}
+		}
+		if atomic.CompareAndSwapInt64(counter, current, current+1) {
+			return current + 1, nil
+		}
 	}
 }
 
@@ -397,7 +644,7 @@ func (e *Engine) mapByBoundaryHash(ctx context.Context, files []FileRecord, upda
 			defer wg.Done()
 			defer diagnostics.ReportPanicAndRepanic("scanner boundary hash worker", map[string]string{"worker": fmt.Sprint(workerID)})
 			for file := range jobs {
-				key, err := e.boundaryHash(file)
+				key, err := e.boundaryHash(ctx, file)
 				select {
 				case results <- boundaryResult{file: file, key: key, err: err}:
 				case <-ctx.Done():
@@ -426,6 +673,7 @@ func (e *Engine) mapByBoundaryHash(ctx context.Context, files []FileRecord, upda
 	}()
 
 	var processed int64
+	var fatalError error
 	groups := make(map[boundaryKey][]FileRecord)
 	for result := range results {
 		if err := ctx.Err(); err != nil {
@@ -433,7 +681,11 @@ func (e *Engine) mapByBoundaryHash(ctx context.Context, files []FileRecord, upda
 		}
 		processed++
 		if result.err != nil {
-			atomic.AddInt64(errorsIgnored, 1)
+			if fatalError == nil && (errors.Is(result.err, errRootChanged) || errors.Is(result.err, errMissingScope)) {
+				fatalError = result.err
+			} else {
+				atomic.AddInt64(errorsIgnored, 1)
+			}
 		} else {
 			groups[result.key] = append(groups[result.key], result.file)
 		}
@@ -448,6 +700,9 @@ func (e *Engine) mapByBoundaryHash(ctx context.Context, files []FileRecord, upda
 			Message:        "Comparing file heads and tails.",
 		})
 	}
+	if fatalError != nil {
+		return nil, fatalError
+	}
 
 	for key, group := range groups {
 		if len(group) < 2 {
@@ -458,17 +713,30 @@ func (e *Engine) mapByBoundaryHash(ctx context.Context, files []FileRecord, upda
 	return groups, ctx.Err()
 }
 
-func (e *Engine) boundaryHash(file FileRecord) (boundaryKey, error) {
-	f, err := os.Open(file.Path)
+func (e *Engine) boundaryHash(ctx context.Context, file FileRecord) (boundaryKey, error) {
+	if err := ctx.Err(); err != nil {
+		return boundaryKey{}, err
+	}
+
+	f, snapshot, _, err := openFileSnapshotInScope(file.Path, file.Scope)
 	if err != nil {
 		return boundaryKey{}, err
 	}
 	defer f.Close()
+	if !recordMatchesSnapshot(file, snapshot) {
+		return boundaryKey{}, errFileChanged
+	}
+	if snapshot.linkCount > 1 {
+		return boundaryKey{}, errHardLinkedFile
+	}
+	if snapshot.namedStreams > 0 {
+		return boundaryKey{}, errNamedStreamFile
+	}
 
 	var head [boundaryReadSize]byte
 	var tail [boundaryReadSize]byte
-	headLen := minInt64(boundaryReadSize, file.Size)
-	tailLen := minInt64(boundaryReadSize, file.Size)
+	headLen := minInt64(boundaryReadSize, snapshot.size)
+	tailLen := minInt64(boundaryReadSize, snapshot.size)
 
 	n, err := f.ReadAt(head[:headLen], 0)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -478,7 +746,10 @@ func (e *Engine) boundaryHash(file FileRecord) (boundaryKey, error) {
 		return boundaryKey{}, io.ErrUnexpectedEOF
 	}
 
-	offset := file.Size - int64(tailLen)
+	if err := ctx.Err(); err != nil {
+		return boundaryKey{}, err
+	}
+	offset := snapshot.size - int64(tailLen)
 	n, err = f.ReadAt(tail[:tailLen], offset)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return boundaryKey{}, err
@@ -486,15 +757,18 @@ func (e *Engine) boundaryHash(file FileRecord) (boundaryKey, error) {
 	if n != tailLen {
 		return boundaryKey{}, io.ErrUnexpectedEOF
 	}
+	if err := verifyStableSnapshotInScope(f, file.Path, snapshot, file.Scope); err != nil {
+		return boundaryKey{}, err
+	}
 
 	hasher := xxhash.New()
 	var sizeBytes [8]byte
-	binary.LittleEndian.PutUint64(sizeBytes[:], uint64(file.Size))
+	binary.LittleEndian.PutUint64(sizeBytes[:], uint64(snapshot.size))
 	_, _ = hasher.Write(sizeBytes[:])
 	_, _ = hasher.Write(head[:headLen])
 	_, _ = hasher.Write(tail[:tailLen])
 
-	return boundaryKey{size: file.Size, hash: hasher.Sum64()}, nil
+	return boundaryKey{size: snapshot.size, hash: hasher.Sum64()}, nil
 }
 
 type fullHashJob struct {
@@ -555,6 +829,7 @@ func (e *Engine) mapByFullHash(ctx context.Context, files []FileRecord, updates 
 	var (
 		processed   int64
 		bytesHashed int64
+		fatalError  error
 	)
 	groups := make(map[fullKey][]FileRecord)
 	for result := range results {
@@ -564,7 +839,11 @@ func (e *Engine) mapByFullHash(ctx context.Context, files []FileRecord, updates 
 		processed++
 		bytesHashed += result.bytesHashed
 		if result.err != nil {
-			atomic.AddInt64(errorsIgnored, 1)
+			if fatalError == nil && (errors.Is(result.err, errRootChanged) || errors.Is(result.err, errMissingScope)) {
+				fatalError = result.err
+			} else {
+				atomic.AddInt64(errorsIgnored, 1)
+			}
 		} else {
 			key := fullKey{size: result.file.Size, hash: result.hash}
 			groups[key] = append(groups[key], result.file)
@@ -580,6 +859,9 @@ func (e *Engine) mapByFullHash(ctx context.Context, files []FileRecord, updates 
 			StartedAt:      startedAt,
 			Message:        "Streaming full file hashes.",
 		})
+	}
+	if fatalError != nil {
+		return nil, fatalError
 	}
 
 	duplicates := make([]DuplicateGroup, 0)
@@ -611,28 +893,64 @@ func (e *Engine) fullHash(ctx context.Context, file FileRecord) (string, int64, 
 		return "", 0, err
 	}
 
-	f, err := os.Open(file.Path)
+	f, snapshot, _, err := openFileSnapshotInScope(file.Path, file.Scope)
 	if err != nil {
 		return "", 0, err
 	}
 	defer f.Close()
+	if !recordMatchesSnapshot(file, snapshot) {
+		return "", 0, errFileChanged
+	}
+	if snapshot.linkCount > 1 {
+		return "", 0, errHardLinkedFile
+	}
+	if snapshot.namedStreams > 0 {
+		return "", 0, errNamedStreamFile
+	}
 
 	hasher := sha256.New()
 	bufPtr := e.bufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer e.bufPool.Put(bufPtr)
 
-	// io.CopyBuffer streams the file through a pooled 64KB buffer, avoiding
-	// whole-file reads and reducing GC pressure on large SSD scans.
-	written, err := io.CopyBuffer(hasher, f, buf)
+	written, err := copyWithContext(ctx, hasher, f, buf)
 	if err != nil {
 		return "", written, err
 	}
-
-	if err := ctx.Err(); err != nil {
+	if err := verifyStableSnapshotInScope(f, file.Path, snapshot, file.Scope); err != nil {
 		return "", written, err
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), written, nil
+}
+
+func copyWithContext(ctx context.Context, destination io.Writer, source io.Reader, buffer []byte) (int64, error) {
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+
+		read, readErr := source.Read(buffer)
+		if read > 0 {
+			count, writeErr := destination.Write(buffer[:read])
+			written += int64(count)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if count != read {
+				return written, io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+		if read == 0 {
+			return written, io.ErrNoProgress
+		}
+	}
 }
 
 func filterRecordsByOptions(files []FileRecord, options ScanOptions) []FileRecord {
@@ -722,39 +1040,40 @@ func minInt64(limit int, value int64) int {
 type directoryQueue struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
-	dirs    []string
+	dirs    []directoryWork
 	pending int
 	closed  bool
 }
 
-func newDirectoryQueue(roots []string) *directoryQueue {
+func newDirectoryQueue(roots []directoryWork) *directoryQueue {
 	q := &directoryQueue{
-		dirs:    append([]string(nil), roots...),
+		dirs:    append([]directoryWork(nil), roots...),
 		pending: len(roots),
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
 
-func (q *directoryQueue) add(dir string) {
+func (q *directoryQueue) add(dir directoryWork) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
-		return
+		return false
 	}
 	q.pending++
 	q.dirs = append(q.dirs, dir)
 	q.cond.Signal()
+	return true
 }
 
-func (q *directoryQueue) next() (string, bool) {
+func (q *directoryQueue) next() (directoryWork, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for len(q.dirs) == 0 && q.pending > 0 && !q.closed {
 		q.cond.Wait()
 	}
 	if q.closed || q.pending == 0 {
-		return "", false
+		return directoryWork{}, false
 	}
 	dir := q.dirs[len(q.dirs)-1]
 	q.dirs = q.dirs[:len(q.dirs)-1]

@@ -1,0 +1,6 @@
+# actionlint v1.7.7 predates GitHub's hosted Windows ARM64 label.
+# Declaring it here enables strict workflow validation without suppressing other
+# runner-label checks. This is an official hosted label, not a self-hosted runner.
+self-hosted-runner:
+  labels:
+    - windows-11-arm

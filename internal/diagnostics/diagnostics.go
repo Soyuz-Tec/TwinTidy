@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const appFolderName = "DuplicateFileFinder"
+const appFolderName = "TwinTidy"
 
 var (
 	mu             sync.Mutex
@@ -22,6 +22,20 @@ var (
 	logDirPath     string
 	sessionLogPath string
 )
+
+var safeCrashFieldNames = map[string]struct{}{
+	"files":           {},
+	"folder_revision": {},
+	"generation":      {},
+	"group_count":     {},
+	"groups":          {},
+	"operation":       {},
+	"phase":           {},
+	"roots":           {},
+	"selected_files":  {},
+	"selected_count":  {},
+	"worker":          {},
+}
 
 func Init(appName string) error {
 	mu.Lock()
@@ -89,8 +103,11 @@ func SessionLogPath() string {
 	return sessionLogPath
 }
 
-func RecoverToError(scope string, fields map[string]string) error {
-	recovered := recover()
+// PanicToError converts a value obtained by calling recover directly inside a
+// deferred function into a crash report and actionable error. Calling recover
+// indirectly through a helper returns nil, so callers must pass the recovered
+// value explicitly.
+func PanicToError(scope string, recovered any, fields map[string]string) error {
 	if recovered == nil {
 		return nil
 	}
@@ -139,7 +156,7 @@ func buildCrashReport(scope string, recovered any, stack []byte, fields map[stri
 	cwd, _ := os.Getwd()
 
 	var builder strings.Builder
-	builder.WriteString("Duplicate File Finder Crash Report\n")
+	builder.WriteString("TwinTidy Crash Report\n")
 	builder.WriteString("==================================\n\n")
 	builder.WriteString("Time: ")
 	builder.WriteString(time.Now().Format(time.RFC3339Nano))
@@ -154,13 +171,13 @@ func buildCrashReport(scope string, recovered any, stack []byte, fields map[stri
 	builder.WriteString("/")
 	builder.WriteString(runtime.GOARCH)
 	builder.WriteString("\nExecutable: ")
-	builder.WriteString(exe)
+	builder.WriteString(filepath.Base(exe))
 	builder.WriteString("\nWorkingDir: ")
-	builder.WriteString(cwd)
+	builder.WriteString(redactedPathSummary(cwd))
 	builder.WriteString("\nSessionLog: ")
-	builder.WriteString(sessionLogPath)
+	builder.WriteString(filepath.Base(sessionLogPath))
 	builder.WriteString("\nArgs: ")
-	builder.WriteString(strings.Join(os.Args, " "))
+	builder.WriteString(argumentSummary(os.Args[1:]))
 	builder.WriteString("\n\nFields:\n")
 
 	if len(fields) == 0 {
@@ -175,7 +192,7 @@ func buildCrashReport(scope string, recovered any, stack []byte, fields map[stri
 			builder.WriteString("- ")
 			builder.WriteString(key)
 			builder.WriteString(": ")
-			builder.WriteString(fields[key])
+			builder.WriteString(crashFieldValue(key, fields[key]))
 			builder.WriteString("\n")
 		}
 	}
@@ -186,6 +203,36 @@ func buildCrashReport(scope string, recovered any, stack []byte, fields map[stri
 		builder.WriteString("\n")
 	}
 	return builder.String()
+}
+
+func crashFieldValue(key string, value string) string {
+	if _, safe := safeCrashFieldNames[key]; safe {
+		return value
+	}
+	return "[redacted]"
+}
+
+func argumentSummary(args []string) string {
+	if len(args) == 0 {
+		return "none"
+	}
+
+	summary := make([]string, 0, len(args))
+	for _, argument := range args {
+		if argument == "-h" || strings.HasPrefix(argument, "--") {
+			summary = append(summary, argument)
+		} else {
+			summary = append(summary, "[redacted]")
+		}
+	}
+	return strings.Join(summary, " ")
+}
+
+func redactedPathSummary(path string) string {
+	if path == "" {
+		return "unknown"
+	}
+	return "[redacted local path]"
 }
 
 func defaultLogDir(appName string) (string, error) {
