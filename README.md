@@ -18,6 +18,7 @@ The desktop workflow includes:
 - native Windows folder selection and progress reporting
 - PDF, text, Word, Excel, PowerPoint, image, audio, video, archive, and `Other` focus filters
 - grouped duplicate results with keep-newest and keep-oldest helpers
+- user-initiated CSV or JSON reports with duplicate metadata and reclaimable-space estimates
 - checkbox-only cleanup planning; highlighting a row never means “remove it”
 - Windows Shell thumbnails, local rich previews, and metadata fallback cards
 - fail-closed cleanup capability gating; the current build never changes files
@@ -53,6 +54,8 @@ Diagnostics are stored under:
 ```
 
 Logs remain on the computer unless the user explicitly shares them. Review diagnostic files before attaching them to a report because local filesystem context can be sensitive.
+
+CSV and JSON duplicate reports are created only through the Export Report action and remain at the location selected by the user. They contain local folder/file paths, hashes, sizes, timestamps, and categories; review or redact them before sharing.
 
 ## Supported platform
 

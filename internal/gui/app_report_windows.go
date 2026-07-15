@@ -4,7 +4,6 @@ package gui
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -91,7 +90,7 @@ func (a *windowsApp) exportReport() {
 		walk.MsgBox(a.mw, "Export Failed", displayUntrustedText(err.Error()), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := report.WriteFileAtomic(path, data); err != nil {
 		diagnostics.Logf("report write failed: error_type=%T", err)
 		walk.MsgBox(a.mw, "Export Failed", displayUntrustedText(err.Error()), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return

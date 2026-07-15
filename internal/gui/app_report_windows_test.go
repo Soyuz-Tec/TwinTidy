@@ -59,7 +59,7 @@ func TestReportBytesForPathSelectsFormatByExtension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CSV serialization failed: %v", err)
 	}
-	if !strings.HasPrefix(string(csvData), "group,sha256,path") {
+	if !strings.HasPrefix(string(csvData), "generatedAt,scanFolder,group,sha256") {
 		t.Fatalf("CSV output missing header: %q", string(csvData[:20]))
 	}
 
@@ -67,7 +67,7 @@ func TestReportBytesForPathSelectsFormatByExtension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fallback serialization failed: %v", err)
 	}
-	if string(fallback[:5]) != "group" {
+	if string(fallback[:11]) != "generatedAt" {
 		t.Fatal("extension-less path did not fall back to CSV")
 	}
 }

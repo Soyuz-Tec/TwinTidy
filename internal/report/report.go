@@ -8,8 +8,13 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Soyuz-Tec/duplicate-file-finder-go/internal/scanner"
 )
@@ -92,24 +97,58 @@ func (d Document) MarshalJSONDocument() ([]byte, error) {
 
 // MarshalCSV renders one row per exported file. Cell values that a
 // spreadsheet would evaluate as formulas are prefixed with an apostrophe so
-// an adversarial file name cannot execute when the report is opened.
+// an adversarial file name cannot execute when the report is opened. Summary
+// estimates appear only on the first applicable row so column totals do not
+// double-count a group or the complete report.
 func (d Document) MarshalCSV() ([]byte, error) {
 	var buffer bytes.Buffer
 	writer := csv.NewWriter(&buffer)
 	writer.UseCRLF = true
 
-	if err := writer.Write([]string{"group", "sha256", "path", "size", "createdAt", "modifiedAt", "category"}); err != nil {
+	if err := writer.Write([]string{
+		"generatedAt",
+		"scanFolder",
+		"group",
+		"sha256",
+		"groupSize",
+		"groupReclaimableBytes",
+		"reportReclaimableBytes",
+		"path",
+		"fileSize",
+		"createdAt",
+		"modifiedAt",
+		"category",
+	}); err != nil {
 		return nil, err
 	}
+	reportTotalWritten := false
 	for index, group := range d.Groups {
-		for _, file := range group.Files {
+		groupReclaimable := int64(0)
+		if extra := int64(len(group.Files)) - 1; extra > 0 {
+			groupReclaimable = extra * group.Size
+		}
+		for fileIndex, file := range group.Files {
+			groupEstimate := ""
+			if fileIndex == 0 {
+				groupEstimate = strconv.FormatInt(groupReclaimable, 10)
+			}
+			reportEstimate := ""
+			if !reportTotalWritten {
+				reportEstimate = strconv.FormatInt(d.ReclaimableBytes, 10)
+				reportTotalWritten = true
+			}
 			row := []string{
+				guardSpreadsheetFormula(d.GeneratedAt),
+				guardSpreadsheetFormula(d.Folder),
 				strconv.Itoa(index + 1),
-				group.Hash,
+				guardSpreadsheetFormula(group.Hash),
+				strconv.FormatInt(group.Size, 10),
+				groupEstimate,
+				reportEstimate,
 				guardSpreadsheetFormula(file.Path),
 				strconv.FormatInt(file.Size, 10),
-				file.CreatedAt,
-				file.ModifiedAt,
+				guardSpreadsheetFormula(file.CreatedAt),
+				guardSpreadsheetFormula(file.ModifiedAt),
 				guardSpreadsheetFormula(file.Category),
 			}
 			if err := writer.Write(row); err != nil {
@@ -122,6 +161,47 @@ func (d Document) MarshalCSV() ([]byte, error) {
 		return nil, err
 	}
 	return buffer.Bytes(), nil
+}
+
+// WriteFileAtomic writes an exported report beside its final destination and
+// renames the complete file into place. A serialization or disk-write failure
+// therefore cannot leave a partially truncated report at the chosen path.
+func WriteFileAtomic(path string, data []byte) error {
+	if path == "" {
+		return errors.New("report path is empty")
+	}
+	dir := filepath.Dir(path)
+	staging, err := os.CreateTemp(dir, "."+filepath.Base(path)+".staging-*")
+	if err != nil {
+		return err
+	}
+	stagingPath := staging.Name()
+	closed := false
+	keepStaging := true
+	defer func() {
+		if !closed {
+			_ = staging.Close()
+		}
+		if keepStaging {
+			_ = os.Remove(stagingPath)
+		}
+	}()
+
+	if _, err := staging.Write(data); err != nil {
+		return err
+	}
+	if err := staging.Sync(); err != nil {
+		return err
+	}
+	if err := staging.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if err := os.Rename(stagingPath, path); err != nil {
+		return err
+	}
+	keepStaging = false
+	return nil
 }
 
 func formatTimestamp(value time.Time) string {
@@ -137,8 +217,18 @@ func guardSpreadsheetFormula(value string) string {
 	if value == "" {
 		return value
 	}
+	trimmed := strings.TrimLeftFunc(value, func(r rune) bool {
+		return unicode.IsSpace(r) || r == '\ufeff'
+	})
+	if trimmed == "" {
+		return value
+	}
+	switch trimmed[0] {
+	case '=', '+', '-', '@':
+		return "'" + value
+	}
 	switch value[0] {
-	case '=', '+', '-', '@', '\t', '\r':
+	case '\t', '\r', '\n':
 		return "'" + value
 	}
 	return value

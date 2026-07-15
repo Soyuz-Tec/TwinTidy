@@ -1,7 +1,10 @@
 package report
 
 import (
+	"encoding/csv"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -90,12 +93,22 @@ func TestCSVGuardsFormulaInjection(t *testing.T) {
 	}
 	text := string(data)
 
-	lines := strings.Split(strings.TrimRight(text, "\r\n"), "\r\n")
-	if len(lines) != 1+5 {
-		t.Fatalf("expected header plus 5 rows, got %d lines", len(lines))
+	records, err := csv.NewReader(strings.NewReader(text)).ReadAll()
+	if err != nil {
+		t.Fatalf("CSV did not parse: %v", err)
 	}
-	if lines[0] != "group,sha256,path,size,createdAt,modifiedAt,category" {
-		t.Fatalf("header = %q", lines[0])
+	if len(records) != 1+5 {
+		t.Fatalf("expected header plus 5 rows, got %d records", len(records))
+	}
+	wantHeader := "generatedAt,scanFolder,group,sha256,groupSize,groupReclaimableBytes,reportReclaimableBytes,path,fileSize,createdAt,modifiedAt,category"
+	if strings.Join(records[0], ",") != wantHeader {
+		t.Fatalf("header = %q", strings.Join(records[0], ","))
+	}
+	if records[1][5] != "4096" || records[1][6] != "4196" {
+		t.Fatalf("first group/report estimates = %q/%q", records[1][5], records[1][6])
+	}
+	if records[2][5] != "" || records[2][6] != "" || records[4][5] != "100" {
+		t.Fatalf("estimate columns were not emitted once per scope: %#v", records)
 	}
 	if !strings.Contains(text, `,'=SUM(A1:A9).txt,`) {
 		t.Fatal("formula-leading path was not neutralized")
@@ -114,11 +127,46 @@ func TestGuardSpreadsheetFormula(t *testing.T) {
 		"-neg":             "'-neg",
 		"@ref":             "'@ref",
 		"\tlead":           "'\tlead",
+		"\nlead":           "'\nlead",
+		" =cmd":            "' =cmd",
+		"\ufeff=cmd":       "'\ufeff=cmd",
+		" plain.txt":       " plain.txt",
 		`C:\normal\path.p`: `C:\normal\path.p`,
 	}
 	for input, expected := range cases {
 		if got := guardSpreadsheetFormula(input); got != expected {
 			t.Fatalf("guardSpreadsheetFormula(%q) = %q, want %q", input, got, expected)
 		}
+	}
+}
+
+func TestWriteFileAtomicCreatesAndReplacesReport(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.csv")
+	if err := WriteFileAtomic(path, []byte("first\r\n")); err != nil {
+		t.Fatalf("first WriteFileAtomic failed: %v", err)
+	}
+	if err := WriteFileAtomic(path, []byte("second\r\n")); err != nil {
+		t.Fatalf("replacement WriteFileAtomic failed: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if string(data) != "second\r\n" {
+		t.Fatalf("report contents = %q", data)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "report.csv" {
+		t.Fatalf("staging file survived successful write: %#v", entries)
+	}
+}
+
+func TestWriteFileAtomicRejectsEmptyPath(t *testing.T) {
+	if err := WriteFileAtomic("", []byte("report")); err == nil {
+		t.Fatal("empty report path was accepted")
 	}
 }
