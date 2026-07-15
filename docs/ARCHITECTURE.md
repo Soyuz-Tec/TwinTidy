@@ -55,6 +55,7 @@ TwinTidy is a modular desktop monolith.
 | Preview adapters | `internal/gui` Windows files | Shell thumbnails and constrained rich/text previews | destructive authority |
 | Diagnostics | `internal/diagnostics` | local session logs and privacy-limited crash reports | file contents or secrets |
 | Settings | `internal/settings` | persisted window placement and last-folder preferences; fail-open load, atomic save | scan results, file authority, or destructive intent |
+| Report export | `internal/report` | cancellable streaming CSV/JSON serialization, spreadsheet-formula neutralization, and atomic same-directory publication | UI-thread ownership, destructive authority, or automatic transmission |
 | Build information | target `internal/buildinfo` | semantic version, commit, source date | runtime update checks |
 
 Boundary direction is UI -> application policy -> scanner/deletion abstractions -> Windows/filesystem adapters. Native adapter types must not leak into policy tests.
@@ -105,6 +106,16 @@ sequenceDiagram
 
 Permanent deletion is not an automatic recovery path. If ever offered, it is a separately initiated command with stronger confirmation and its own ADR.
 
+### Report export
+
+1. The user explicitly chooses a format and destination from the results view.
+2. The GUI makes the selected format authoritative, resolves the final path and extension, and obtains overwrite authorization for that exact resolved path.
+3. A background worker snapshots the reviewed groups and streams CSV or JSON to a short staging file in the destination directory. CSV data cells that could be interpreted as formulas are neutralized.
+4. Cancellation or failure removes the staging file and leaves an existing destination unchanged. A successful write is synced, closed, and atomically published to the final path.
+5. Completion is marshaled to the UI thread and ignored if its folder revision or result generation is stale.
+
+The exporter contains no upload client or automatic transmission path. Saving to a sync-managed, cloud-backed, or network filesystem destination can still cause the operating system or configured provider to transfer the report outside TwinTidy's control. [ADR 0007](adr/0007-streamed-report-export.md) records the concurrency, destination-authorization, and atomic-publication decision.
+
 ## 7. State and concurrency
 
 The application state machine is:
@@ -112,11 +123,15 @@ The application state machine is:
 ```text
 NoFolder -> FolderReady -> SurfaceScanning/Cancelling -> SurfaceReady
 SurfaceReady -> DuplicateScanning/Cancelling -> ResultsReady
+ResultsReady -> Exporting/ExportCancelling -> ResultsReady
 ResultsReady -> Deleting -> ResultsReady
+Exporting/ExportCancelling -> ClosingAfterExport -> Closing
 Deleting -> ClosingAfterDelete -> Closing
 ```
 
 Cancellation returns to the last coherent state. Every asynchronous operation carries an immutable generation identifier and folder revision. UI callbacks compare both inside the UI-thread callback before changing state or rows. Only one foreground operation may be active. Closing during a scan cancels and invalidates that work. When an identity-bound native recycle adapter is available, closing during that operation is deferred until its matching result has been applied. Late callbacks cannot mutate the next folder or window lifecycle.
+
+Report export is a read-only background operation over an immutable result snapshot. At most one export runs at a time. Closing requests cancellation and waits for the matching operation acknowledgement so sensitive staging data can be removed before process exit; stale completion cannot replace newer UI status or results.
 
 Hash loops and directory enumeration check context between bounded reads or entries. Slow files must not make cancellation wait until EOF.
 

@@ -23,7 +23,10 @@ const (
 	phaseDuplicateScanning
 	phaseDuplicateCancelling
 	phaseResultsReady
+	phaseExporting
+	phaseExportCancelling
 	phaseDeleting
+	phaseClosingAfterExport
 	phaseClosingAfterDelete
 	phaseClosing
 )
@@ -46,8 +49,14 @@ func (phase appPhase) String() string {
 		return "duplicate scan cancelling"
 	case phaseResultsReady:
 		return "results ready"
+	case phaseExporting:
+		return "exporting report"
+	case phaseExportCancelling:
+		return "report export cancelling"
 	case phaseDeleting:
 		return "deleting"
+	case phaseClosingAfterExport:
+		return "closing after report export"
 	case phaseClosingAfterDelete:
 		return "closing after delete"
 	case phaseClosing:
@@ -62,6 +71,7 @@ type operationKind uint8
 const (
 	operationSurfaceScan operationKind = iota + 1
 	operationDuplicateScan
+	operationExport
 	operationDelete
 )
 
@@ -71,6 +81,8 @@ func (kind operationKind) String() string {
 		return "surface scan"
 	case operationDuplicateScan:
 		return "duplicate scan"
+	case operationExport:
+		return "report export"
 	case operationDelete:
 		return "delete"
 	default:
@@ -230,6 +242,44 @@ func (state *operationState) requestScanCancellation() bool {
 	return true
 }
 
+func (state *operationState) beginExport(startedAt time.Time, cancel context.CancelFunc) (operationToken, error) {
+	if state.phase != phaseResultsReady {
+		return operationToken{}, state.transitionError("start report export")
+	}
+	return state.beginOperation(operationExport, phaseExporting, startedAt, cancel), nil
+}
+
+// requestExportCancellation asks the writer to remove its staging file and
+// acknowledge completion before result controls are re-enabled.
+func (state *operationState) requestExportCancellation() bool {
+	if state.phase != phaseExporting {
+		return false
+	}
+	state.phase = phaseExportCancelling
+	state.invokeCancellation()
+	return true
+}
+
+// completeExport retires only the matching export. Window close is deferred
+// until this acknowledgement so a process exit cannot strand sensitive
+// staging data beside the selected destination.
+func (state *operationState) completeExport(token operationToken) (accepted bool, shouldClose bool) {
+	if token.kind != operationExport || !state.accepts(token) {
+		return false, false
+	}
+
+	closing := state.phase == phaseClosingAfterExport
+	state.clearActiveOperation()
+	if closing {
+		state.phase = phaseClosing
+		state.allowClose = true
+		return true, true
+	}
+
+	state.phase = phaseResultsReady
+	return true, false
+}
+
 func (state *operationState) beginDelete(startedAt time.Time) (operationToken, error) {
 	if state.phase != phaseResultsReady {
 		return operationToken{}, state.transitionError("start delete")
@@ -258,8 +308,8 @@ func (state *operationState) completeDelete(token operationToken) (accepted bool
 }
 
 // requestClose allows normal shutdown immediately, but a destructive operation
-// is never abandoned midway. Closing during delete is vetoed until the matching
-// delete completion has been applied.
+// and a report writer with a sensitive staging file are never abandoned midway.
+// Closing is vetoed until the matching worker completion has been applied.
 func (state *operationState) requestClose() closeDisposition {
 	if state.allowClose {
 		return closeNow
@@ -267,6 +317,12 @@ func (state *operationState) requestClose() closeDisposition {
 
 	state.closeRequested = true
 	switch state.phase {
+	case phaseExporting, phaseExportCancelling:
+		state.phase = phaseClosingAfterExport
+		state.invokeCancellation()
+		return closeDeferred
+	case phaseClosingAfterExport:
+		return closeDeferred
 	case phaseDeleting:
 		state.phase = phaseClosingAfterDelete
 		return closeDeferred
@@ -305,6 +361,8 @@ func (state *operationState) accepts(token operationToken) bool {
 		return state.phase == phaseSurfaceScanning || state.phase == phaseSurfaceCancelling
 	case operationDuplicateScan:
 		return state.phase == phaseDuplicateScanning || state.phase == phaseDuplicateCancelling
+	case operationExport:
+		return state.phase == phaseExporting || state.phase == phaseExportCancelling || state.phase == phaseClosingAfterExport
 	case operationDelete:
 		return state.phase == phaseDeleting || state.phase == phaseClosingAfterDelete
 	default:

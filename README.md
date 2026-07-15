@@ -18,6 +18,7 @@ The desktop workflow includes:
 - native Windows folder selection and progress reporting
 - PDF, text, Word, Excel, PowerPoint, image, audio, video, archive, and `Other` focus filters
 - grouped duplicate results with keep-newest and keep-oldest helpers
+- user-initiated, background-streamed CSV or JSON reports with duplicate metadata and reclaimable-space estimates
 - checkbox-only cleanup planning; highlighting a row never means “remove it”
 - Windows Shell thumbnails, local rich previews, and metadata fallback cards
 - fail-closed cleanup capability gating; the current build never changes files
@@ -53,6 +54,10 @@ Diagnostics are stored under:
 ```
 
 Logs remain on the computer unless the user explicitly shares them. Review diagnostic files before attaching them to a report because local filesystem context can be sensitive.
+
+CSV and JSON duplicate reports are created only through the Export Report action. They contain local folder/file paths, hashes, sizes, timestamps, and categories; CSV data cells that could be interpreted as spreadsheet formulas are neutralized. Export is cancellable and runs off the UI thread, using same-directory staging and atomic publication only after the exact normalized destination has been authorized for overwrite.
+
+TwinTidy does not upload reports. A report saved to a OneDrive-managed, cloud-synced, or network destination may still be transferred by that provider under its own configuration. Review or redact reports before sharing.
 
 ## Supported platform
 

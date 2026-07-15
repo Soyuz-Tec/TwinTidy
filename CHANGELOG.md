@@ -9,10 +9,16 @@ All notable TwinTidy changes will be documented here. The project uses [Semantic
 - Staticcheck, workflow linting, race-detector tests, and a total-coverage floor as CI quality gates.
 - Fuzz targets for directory protection, user-file classification, and category mapping, plus staged-scan throughput benchmarks.
 - Persisted interface preferences: the main window reopens at its last on-screen position and the folder picker starts from the previously scanned folder. Preferences live in `%LOCALAPPDATA%\TwinTidy\settings.json`, load fail-open, and are saved atomically.
+- An Export Report action that saves the reviewed duplicate groups as CSV or JSON, including per-group hashes, per-file metadata, and a keep-one-copy reclaimable-bytes estimate. CSV cells that spreadsheets would evaluate as formulas are neutralized.
 
 ### Changed
 
 - Replaced deprecated `syscall.Syscall` COM calls with `syscall.SyscallN` in the folder dialog and Shell thumbnail adapters, and removed an unused snapshot-verification helper superseded by its scope-aware variant.
+- Report export now streams on a cancellable background worker instead of buffering the complete report on the UI thread.
+
+### Security
+
+- Report overwrite approval is bound to the exact format-normalized destination. Writes use short same-directory staging files, atomic publication, and cleanup on failure or cancellation; privacy guidance now calls out path/hash disclosure and independently configured sync, cloud, and network providers.
 
 ## [0.1.0-beta.1] - 2026-07-12
 
