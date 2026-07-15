@@ -232,7 +232,9 @@ foreach ($arch in $targets) {
         if ([System.IO.File]::Exists($packagePath)) {
             [System.IO.File]::Delete($packagePath)
         }
-        & $makeAppx pack /d $stage /p $packagePath /o /h SHA256
+        # MakeAppx writes progress to stdout; keep it out of this script's pipeline
+        # output, which callers consume as structured packaging results.
+        & $makeAppx pack /d $stage /p $packagePath /o /h SHA256 | Out-Host
         if ($LASTEXITCODE -ne 0 -or -not [System.IO.File]::Exists($packagePath)) {
             throw "MakeAppx failed to create the unsigned $arch MSIX package."
         }

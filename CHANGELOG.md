@@ -22,6 +22,11 @@ All notable TwinTidy changes will be documented here. The project uses [Semantic
 - Pinned the supported Go patch toolchain and made startup/smoke failures visible through process exit status.
 - Drained the Walk message loop during UI smoke shutdown to remove a startup-layout race.
 
+### Fixed
+
+- Derived the MSIX logo assets with integer-only box filtering and a fixed PNG serialization so the deterministic asset check reproduces identical bytes on amd64 and ARM64 hosts; the previous GDI+ scaling was architecture-dependent.
+- Kept MakeAppx console output out of the structured `package-msix.ps1` results, which crashed strict-mode consumers such as the MSIX lifecycle gate.
+
 ### Security
 
 - Added group-aware pre-action revalidation and disabled path-based Windows Recycle Bin calls until the verified file identity can remain authoritative through the native operation.
