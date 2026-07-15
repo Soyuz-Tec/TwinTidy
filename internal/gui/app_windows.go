@@ -71,6 +71,7 @@ type windowsApp struct {
 	keepNewestButton    *walk.PushButton
 	keepOldestButton    *walk.PushButton
 	clearSelectButton   *walk.PushButton
+	exportButton        *walk.PushButton
 	openButton          *walk.PushButton
 	previewSafetyButton *walk.PushButton
 	deleteButton        *walk.PushButton
@@ -297,6 +298,7 @@ func (a *windowsApp) create() error {
 					PushButton{AssignTo: &a.keepNewestButton, Text: "Keep Newest", Font: macControlFont(), OnClicked: a.selectAllExceptNewest},
 					PushButton{AssignTo: &a.keepOldestButton, Text: "Keep Oldest", Font: macControlFont(), OnClicked: a.selectAllExceptOldest},
 					PushButton{AssignTo: &a.clearSelectButton, Text: "Clear Selection", Font: macControlFont(), OnClicked: a.clearSelection},
+					PushButton{AssignTo: &a.exportButton, Text: "Export Report", Font: macControlFont(), OnClicked: a.exportReport},
 					PushButton{AssignTo: &a.openButton, Text: "Show In Explorer", Font: macControlFont(), OnClicked: a.showSelectedInExplorer},
 					PushButton{AssignTo: &a.previewSafetyButton, Text: "Preview Safety", Font: macControlFont(), OnClicked: a.showPreviewSafety},
 					HSpacer{},
@@ -445,6 +447,7 @@ func (a *windowsApp) renderFromPhase() {
 	a.keepNewestButton.SetEnabled(controls.resultActions)
 	a.keepOldestButton.SetEnabled(controls.resultActions)
 	a.clearSelectButton.SetEnabled(controls.resultActions)
+	a.exportButton.SetEnabled(controls.resultActions)
 	a.deleteButton.SetEnabled(controls.deleteSelected && scanner.RecycleSupported())
 
 	currentIndex := a.table.CurrentIndex()
