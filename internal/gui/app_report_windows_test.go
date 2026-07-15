@@ -3,7 +3,9 @@
 package gui
 
 import (
-	"strings"
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -42,33 +44,78 @@ func TestDuplicateGroupsFromRowsSkipsNonDuplicates(t *testing.T) {
 	}
 }
 
-func TestReportBytesForPathSelectsFormatByExtension(t *testing.T) {
-	document := report.BuildDocument(`C:\scanned`, []scanner.DuplicateGroup{
+func TestResolveReportDestinationUsesSelectedFilter(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		filterIndex int
+		wantPath    string
+		wantFormat  report.Format
+	}{
+		{"CSV default", `C:\out\report.csv`, 1, `C:\out\report.csv`, report.FormatCSV},
+		{"JSON replaces CSV default", `C:\out\report.csv`, 2, `C:\out\report.json`, report.FormatJSON},
+		{"CSV replaces JSON", `C:\out\report.JSON`, 1, `C:\out\report.csv`, report.FormatCSV},
+		{"missing JSON extension", `C:\out\report`, 2, `C:\out\report.json`, report.FormatJSON},
+		{"custom suffix retained", `C:\out\report.backup`, 1, `C:\out\report.backup.csv`, report.FormatCSV},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path, format, err := resolveReportDestination(test.path, test.filterIndex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if path != test.wantPath || format != test.wantFormat {
+				t.Fatalf("resolveReportDestination() = %q/%q, want %q/%q", path, format, test.wantPath, test.wantFormat)
+			}
+		})
+	}
+	if _, _, err := resolveReportDestination("  ", 1); err == nil {
+		t.Fatal("empty destination was accepted")
+	}
+}
+
+func TestNormalizedDestinationRequiresIndependentOverwriteCheck(t *testing.T) {
+	if !pathsReferToSameDestination(`C:\Out\Report.csv`, `c:\out\report.CSV`) {
+		t.Fatal("case-only Windows path difference was treated as another destination")
+	}
+	if pathsReferToSameDestination(`C:\out\report.csv`, `C:\out\report.json`) {
+		t.Fatal("format-normalized destination was treated as the dialog destination")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.json")
+	if exists, err := resolvedReportDestinationExists(path); err != nil || exists {
+		t.Fatalf("missing destination exists=%v err=%v", exists, err)
+	}
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := resolvedReportDestinationExists(path); err != nil || !exists {
+		t.Fatalf("existing destination exists=%v err=%v", exists, err)
+	}
+	if exists, err := resolvedReportDestinationExists(dir); err == nil || exists {
+		t.Fatalf("directory destination exists=%v err=%v", exists, err)
+	}
+}
+
+func TestWriteReportFileUsesAuthoritativeFormat(t *testing.T) {
+	groups := []scanner.DuplicateGroup{
 		{Size: 10, Hash: "aa", Files: []scanner.FileRecord{{Path: `C:\a1`, Size: 10}, {Path: `C:\a2`, Size: 10}}},
-	}, time.Now())
-
-	jsonData, err := reportBytesForPath(`C:\out\report.JSON`, document)
+	}
+	path := filepath.Join(t.TempDir(), "report.json")
+	result := writeReportFile(context.Background(), path, report.FormatJSON, `C:\scanned`, groups, time.Now())
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("JSON serialization failed: %v", err)
+		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(jsonData), "{") {
-		t.Fatalf("JSON output does not look like JSON: %q", jsonData[:1])
+	if len(data) == 0 || data[0] != '{' {
+		t.Fatalf("JSON export does not start with an object: %q", data)
 	}
-
-	csvData, err := reportBytesForPath(`C:\out\report.csv`, document)
-	if err != nil {
-		t.Fatalf("CSV serialization failed: %v", err)
-	}
-	if !strings.HasPrefix(string(csvData), "generatedAt,scanFolder,group,sha256") {
-		t.Fatalf("CSV output missing header: %q", string(csvData[:20]))
-	}
-
-	fallback, err := reportBytesForPath(`C:\out\no-extension`, document)
-	if err != nil {
-		t.Fatalf("fallback serialization failed: %v", err)
-	}
-	if string(fallback[:11]) != "generatedAt" {
-		t.Fatal("extension-less path did not fall back to CSV")
+	if result.summary.GroupCount != 1 || result.summary.FileCount != 2 || result.bytes != int64(len(data)) {
+		t.Fatalf("export result = %+v file bytes=%d", result, len(data))
 	}
 }
 

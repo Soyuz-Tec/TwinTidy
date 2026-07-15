@@ -19,6 +19,7 @@ ADRs record material decisions that should not be rediscovered from code or chat
 | [0004](0004-versioning-signing-release.md) | Accepted | Use SemVer, reproducible unsigned builds, protected signing, and immutable releases |
 | [0005](0005-disable-path-based-recycle.md) | Accepted | Disable path-based Windows recycling until the destructive sink is identity-bound |
 | [0006](0006-per-user-msix-distribution.md) | Accepted | Ship a protected, signed, per-user MSIX for x64 and ARM64 alongside portable packages |
+| [0007](0007-streamed-report-export.md) | Accepted | Stream report exports through a cancellable, generation-scoped atomic writer |
 
 ## Creating an ADR
 

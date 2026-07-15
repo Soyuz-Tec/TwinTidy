@@ -6,9 +6,12 @@ package report
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +24,39 @@ import (
 
 // Schema identifies the JSON document layout.
 const Schema = "twintidy.duplicate-report/v1"
+
+// Format identifies a supported report serialization.
+type Format string
+
+const (
+	// FormatCSV emits one spreadsheet-safe row per duplicate file.
+	FormatCSV Format = "csv"
+	// FormatJSON emits the canonical duplicate-report JSON document.
+	FormatJSON Format = "json"
+)
+
+// Extension returns the conventional file extension for the format.
+// Unsupported formats return an empty string.
+func (f Format) Extension() string {
+	switch f {
+	case FormatCSV:
+		return ".csv"
+	case FormatJSON:
+		return ".json"
+	default:
+		return ""
+	}
+}
+
+// Summary describes the report content and the successfully streamed byte
+// count. BytesWritten can be non-zero with an error when a destination fails
+// partway through a write.
+type Summary struct {
+	GroupCount       int
+	FileCount        int
+	ReclaimableBytes int64
+	BytesWritten     int64
+}
 
 // File is one member of an exported duplicate group.
 type File struct {
@@ -68,13 +104,7 @@ func BuildDocument(folder string, groups []scanner.DuplicateGroup, generatedAt t
 			Files: make([]File, 0, len(group.Files)),
 		}
 		for _, file := range group.Files {
-			exported.Files = append(exported.Files, File{
-				Path:       file.Path,
-				Size:       file.Size,
-				CreatedAt:  formatTimestamp(file.CreatedAt),
-				ModifiedAt: formatTimestamp(file.ModifiedAt),
-				Category:   string(file.Category),
-			})
+			exported.Files = append(exported.Files, fileFromRecord(file))
 		}
 		document.Groups = append(document.Groups, exported)
 		document.FileCount += len(exported.Files)
@@ -105,28 +135,12 @@ func (d Document) MarshalCSV() ([]byte, error) {
 	writer := csv.NewWriter(&buffer)
 	writer.UseCRLF = true
 
-	if err := writer.Write([]string{
-		"generatedAt",
-		"scanFolder",
-		"group",
-		"sha256",
-		"groupSize",
-		"groupReclaimableBytes",
-		"reportReclaimableBytes",
-		"path",
-		"fileSize",
-		"createdAt",
-		"modifiedAt",
-		"category",
-	}); err != nil {
+	if err := writer.Write(csvHeader); err != nil {
 		return nil, err
 	}
 	reportTotalWritten := false
 	for index, group := range d.Groups {
-		groupReclaimable := int64(0)
-		if extra := int64(len(group.Files)) - 1; extra > 0 {
-			groupReclaimable = extra * group.Size
-		}
+		groupReclaimable := reclaimableBytes(group.Size, len(group.Files))
 		for fileIndex, file := range group.Files {
 			groupEstimate := ""
 			if fileIndex == 0 {
@@ -137,21 +151,16 @@ func (d Document) MarshalCSV() ([]byte, error) {
 				reportEstimate = strconv.FormatInt(d.ReclaimableBytes, 10)
 				reportTotalWritten = true
 			}
-			row := []string{
-				guardSpreadsheetFormula(d.GeneratedAt),
-				guardSpreadsheetFormula(d.Folder),
-				strconv.Itoa(index + 1),
-				guardSpreadsheetFormula(group.Hash),
-				strconv.FormatInt(group.Size, 10),
+			if err := writer.Write(csvRow(
+				d.GeneratedAt,
+				d.Folder,
+				index,
+				group.Size,
+				group.Hash,
+				file,
 				groupEstimate,
 				reportEstimate,
-				guardSpreadsheetFormula(file.Path),
-				strconv.FormatInt(file.Size, 10),
-				guardSpreadsheetFormula(file.CreatedAt),
-				guardSpreadsheetFormula(file.ModifiedAt),
-				guardSpreadsheetFormula(file.Category),
-			}
-			if err := writer.Write(row); err != nil {
+			)); err != nil {
 				return nil, err
 			}
 		}
@@ -163,45 +172,365 @@ func (d Document) MarshalCSV() ([]byte, error) {
 	return buffer.Bytes(), nil
 }
 
-// WriteFileAtomic writes an exported report beside its final destination and
-// renames the complete file into place. A serialization or disk-write failure
-// therefore cannot leave a partially truncated report at the chosen path.
-func WriteFileAtomic(path string, data []byte) error {
-	if path == "" {
-		return errors.New("report path is empty")
+// Write streams a report directly to w without first retaining the complete
+// serialized document in memory. It checks ctx while counting, between rows,
+// and around destination writes so cancellation stops large exports promptly.
+func Write(
+	ctx context.Context,
+	w io.Writer,
+	format Format,
+	folder string,
+	groups []scanner.DuplicateGroup,
+	generatedAt time.Time,
+) (Summary, error) {
+	if ctx == nil {
+		return Summary{}, errors.New("report context is nil")
 	}
-	dir := filepath.Dir(path)
-	staging, err := os.CreateTemp(dir, "."+filepath.Base(path)+".staging-*")
+	if w == nil {
+		return Summary{}, errors.New("report writer is nil")
+	}
+	if format.Extension() == "" {
+		return Summary{}, fmt.Errorf("unsupported report format %q", format)
+	}
+
+	summary, err := summarize(ctx, groups)
 	if err != nil {
-		return err
+		return summary, err
+	}
+	counted := &contextWriter{ctx: ctx, writer: w}
+	switch format {
+	case FormatCSV:
+		err = writeCSV(ctx, counted, folder, groups, generatedAt, summary)
+	case FormatJSON:
+		err = writeJSON(ctx, counted, folder, groups, generatedAt, summary)
+	}
+	summary.BytesWritten = counted.bytesWritten
+	return summary, err
+}
+
+// WriteFileAtomic creates a short-named staging file beside path, invokes
+// write to populate it, syncs and closes the complete file, then renames it
+// into place. Any callback, I/O, or cancellation failure removes the staging
+// file and preserves an existing destination unchanged.
+func WriteFileAtomic(
+	ctx context.Context,
+	path string,
+	write func(io.Writer) error,
+) (int64, error) {
+	if ctx == nil {
+		return 0, errors.New("report context is nil")
+	}
+	if path == "" {
+		return 0, errors.New("report path is empty")
+	}
+	if write == nil {
+		return 0, errors.New("report write callback is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	dir := filepath.Dir(path)
+	staging, err := os.CreateTemp(dir, ".twintidy-report-*")
+	if err != nil {
+		return 0, err
 	}
 	stagingPath := staging.Name()
 	closed := false
-	keepStaging := true
+	renamed := false
 	defer func() {
 		if !closed {
 			_ = staging.Close()
 		}
-		if keepStaging {
+		if !renamed {
 			_ = os.Remove(stagingPath)
 		}
 	}()
 
-	if _, err := staging.Write(data); err != nil {
-		return err
+	counted := &contextWriter{ctx: ctx, writer: staging}
+	if err := write(counted); err != nil {
+		return counted.bytesWritten, err
+	}
+	if err := ctx.Err(); err != nil {
+		return counted.bytesWritten, err
 	}
 	if err := staging.Sync(); err != nil {
-		return err
+		return counted.bytesWritten, err
+	}
+	if err := ctx.Err(); err != nil {
+		return counted.bytesWritten, err
 	}
 	if err := staging.Close(); err != nil {
-		return err
+		return counted.bytesWritten, err
 	}
 	closed = true
+	if err := ctx.Err(); err != nil {
+		return counted.bytesWritten, err
+	}
 	if err := os.Rename(stagingPath, path); err != nil {
+		return counted.bytesWritten, err
+	}
+	renamed = true
+	return counted.bytesWritten, nil
+}
+
+var csvHeader = []string{
+	"generatedAt",
+	"scanFolder",
+	"group",
+	"sha256",
+	"groupSize",
+	"groupReclaimableBytes",
+	"reportReclaimableBytes",
+	"path",
+	"fileSize",
+	"createdAt",
+	"modifiedAt",
+	"category",
+}
+
+func summarize(ctx context.Context, groups []scanner.DuplicateGroup) (Summary, error) {
+	summary := Summary{GroupCount: len(groups)}
+	for _, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return summary, err
+		}
+		summary.FileCount += len(group.Files)
+		summary.ReclaimableBytes += reclaimableBytes(group.Size, len(group.Files))
+	}
+	return summary, nil
+}
+
+func reclaimableBytes(size int64, fileCount int) int64 {
+	if extra := int64(fileCount) - 1; extra > 0 {
+		return extra * size
+	}
+	return 0
+}
+
+func writeCSV(
+	ctx context.Context,
+	w io.Writer,
+	folder string,
+	groups []scanner.DuplicateGroup,
+	generatedAt time.Time,
+	summary Summary,
+) error {
+	writer := csv.NewWriter(w)
+	writer.UseCRLF = true
+	if err := writer.Write(csvHeader); err != nil {
 		return err
 	}
-	keepStaging = false
+
+	reportTotalWritten := false
+	formattedGeneratedAt := generatedAt.UTC().Format(time.RFC3339)
+	for groupIndex, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		groupReclaimable := reclaimableBytes(group.Size, len(group.Files))
+		for fileIndex, record := range group.Files {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			groupEstimate := ""
+			if fileIndex == 0 {
+				groupEstimate = strconv.FormatInt(groupReclaimable, 10)
+			}
+			reportEstimate := ""
+			if !reportTotalWritten {
+				reportEstimate = strconv.FormatInt(summary.ReclaimableBytes, 10)
+				reportTotalWritten = true
+			}
+			if err := writer.Write(csvRow(
+				formattedGeneratedAt,
+				folder,
+				groupIndex,
+				group.Size,
+				group.Hash,
+				fileFromRecord(record),
+				groupEstimate,
+				reportEstimate,
+			)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	writer.Flush()
+	return writer.Error()
+}
+
+func csvRow(
+	generatedAt string,
+	folder string,
+	groupIndex int,
+	groupSize int64,
+	hash string,
+	file File,
+	groupEstimate string,
+	reportEstimate string,
+) []string {
+	return []string{
+		guardSpreadsheetFormula(generatedAt),
+		guardSpreadsheetFormula(folder),
+		strconv.Itoa(groupIndex + 1),
+		guardSpreadsheetFormula(hash),
+		strconv.FormatInt(groupSize, 10),
+		groupEstimate,
+		reportEstimate,
+		guardSpreadsheetFormula(file.Path),
+		strconv.FormatInt(file.Size, 10),
+		guardSpreadsheetFormula(file.CreatedAt),
+		guardSpreadsheetFormula(file.ModifiedAt),
+		guardSpreadsheetFormula(file.Category),
+	}
+}
+
+func writeJSON(
+	ctx context.Context,
+	w io.Writer,
+	folder string,
+	groups []scanner.DuplicateGroup,
+	generatedAt time.Time,
+	summary Summary,
+) error {
+	if err := writeString(w, "{\n  \"schema\": "); err != nil {
+		return err
+	}
+	if err := writeJSONValue(w, Schema); err != nil {
+		return err
+	}
+	if err := writeString(w, ",\n  \"generatedAt\": "); err != nil {
+		return err
+	}
+	if err := writeJSONValue(w, generatedAt.UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if folder != "" {
+		if err := writeString(w, ",\n  \"folder\": "); err != nil {
+			return err
+		}
+		if err := writeJSONValue(w, folder); err != nil {
+			return err
+		}
+	}
+	if err := writeString(w, ",\n  \"groupCount\": "+strconv.Itoa(summary.GroupCount)); err != nil {
+		return err
+	}
+	if err := writeString(w, ",\n  \"fileCount\": "+strconv.Itoa(summary.FileCount)); err != nil {
+		return err
+	}
+	if err := writeString(w, ",\n  \"reclaimableBytes\": "+strconv.FormatInt(summary.ReclaimableBytes, 10)); err != nil {
+		return err
+	}
+	if err := writeString(w, ",\n  \"groups\": ["); err != nil {
+		return err
+	}
+
+	for groupIndex, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		separator := "\n"
+		if groupIndex > 0 {
+			separator = ",\n"
+		}
+		if err := writeString(w, separator+"    {\n      \"size\": "+strconv.FormatInt(group.Size, 10)+",\n      \"sha256\": "); err != nil {
+			return err
+		}
+		if err := writeJSONValue(w, group.Hash); err != nil {
+			return err
+		}
+		if err := writeString(w, ",\n      \"files\": ["); err != nil {
+			return err
+		}
+		for fileIndex, record := range group.Files {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			fileSeparator := "\n"
+			if fileIndex > 0 {
+				fileSeparator = ",\n"
+			}
+			if err := writeString(w, fileSeparator+"        "); err != nil {
+				return err
+			}
+			if err := writeJSONValue(w, fileFromRecord(record)); err != nil {
+				return err
+			}
+		}
+		if len(group.Files) > 0 {
+			if err := writeString(w, "\n      "); err != nil {
+				return err
+			}
+		}
+		if err := writeString(w, "]\n    }"); err != nil {
+			return err
+		}
+	}
+	if len(groups) > 0 {
+		if err := writeString(w, "\n  "); err != nil {
+			return err
+		}
+	}
+	return writeString(w, "]\n}\n")
+}
+
+func writeJSONValue(w io.Writer, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
+}
+
+func writeString(w io.Writer, value string) error {
+	n, err := io.WriteString(w, value)
+	if err != nil {
+		return err
+	}
+	if n != len(value) {
+		return io.ErrShortWrite
+	}
 	return nil
+}
+
+type contextWriter struct {
+	ctx          context.Context
+	writer       io.Writer
+	bytesWritten int64
+}
+
+func (w *contextWriter) Write(data []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := w.writer.Write(data)
+	w.bytesWritten += int64(n)
+	if err != nil {
+		return n, err
+	}
+	if n != len(data) {
+		return n, io.ErrShortWrite
+	}
+	if err := w.ctx.Err(); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func fileFromRecord(file scanner.FileRecord) File {
+	return File{
+		Path:       file.Path,
+		Size:       file.Size,
+		CreatedAt:  formatTimestamp(file.CreatedAt),
+		ModifiedAt: formatTimestamp(file.ModifiedAt),
+		Category:   string(file.Category),
+	}
 }
 
 func formatTimestamp(value time.Time) string {

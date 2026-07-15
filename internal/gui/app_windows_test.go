@@ -132,7 +132,19 @@ func TestControlsForOperationPhase(t *testing.T) {
 			},
 		},
 		{
+			phase: phaseExporting,
+			want:  phaseControls{cancel: true, scanText: "Find Duplicates"},
+		},
+		{
+			phase: phaseExportCancelling,
+			want:  phaseControls{scanText: "Find Duplicates"},
+		},
+		{
 			phase: phaseDeleting,
+			want:  phaseControls{scanText: "Find Duplicates"},
+		},
+		{
+			phase: phaseClosingAfterExport,
 			want:  phaseControls{scanText: "Find Duplicates"},
 		},
 		{

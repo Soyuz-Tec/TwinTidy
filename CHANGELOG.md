@@ -14,6 +14,11 @@ All notable TwinTidy changes will be documented here. The project uses [Semantic
 ### Changed
 
 - Replaced deprecated `syscall.Syscall` COM calls with `syscall.SyscallN` in the folder dialog and Shell thumbnail adapters, and removed an unused snapshot-verification helper superseded by its scope-aware variant.
+- Report export now streams on a cancellable background worker instead of buffering the complete report on the UI thread.
+
+### Security
+
+- Report overwrite approval is bound to the exact format-normalized destination. Writes use short same-directory staging files, atomic publication, and cleanup on failure or cancellation; privacy guidance now calls out path/hash disclosure and independently configured sync, cloud, and network providers.
 
 ## [0.1.0-beta.1] - 2026-07-12
 

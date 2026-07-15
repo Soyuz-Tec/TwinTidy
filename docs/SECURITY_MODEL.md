@@ -9,8 +9,9 @@ TwinTidy must help users remove verified redundancy without creating a new path 
 ## Assets
 
 - User files and the continued availability of at least one verified copy
-- File paths, metadata, and duplicate-group information
+- File paths, metadata, content hashes, and duplicate-group information
 - User intent: selected roots, chosen keepers, and confirmed recycle targets
+- Exported reports and their same-directory staging files
 - Local diagnostics and crash reports
 - Release binaries, manifests, checksums, provenance, and signing identity
 - Maintainer credentials and GitHub workflow permissions
@@ -22,7 +23,8 @@ TwinTidy must help users remove verified redundancy without creating a new path 
 3. **Windows Shell, COM, browser, and preview handlers:** external system components parse untrusted content and can fail, hang, or navigate unexpectedly.
 4. **Recycle service:** currently disabled at the production adapter; any future implementation must interpret native results, cancellation, file identity, and source-path state.
 5. **Diagnostics boundary:** support information leaves the process and may later be shared publicly.
-6. **Build and release supply chain:** source, dependencies, actions, build workers, artifacts, signing identity, and release permissions have different trust levels.
+6. **Report-export boundary:** a report discloses paths, hashes, and metadata to a user-chosen destination; sync clients or network providers may transfer it under their own configuration.
+7. **Build and release supply chain:** source, dependencies, actions, build workers, artifacts, signing identity, and release permissions have different trust levels.
 
 ## Threats and required controls
 
@@ -40,12 +42,16 @@ TwinTidy must help users remove verified redundancy without creating a new path 
 | Malicious preview content | Bounded reads, constrained WebView navigation, no macro execution, explicit open action for risky formats |
 | Resource exhaustion | Streaming hashes, bounded buffers/previews, concurrency limits, cancellation, and progress visibility |
 | Sensitive diagnostics | No file contents, environment dumps, credentials, or silent uploads; warn users to review logs before sharing |
+| Sensitive report disclosure | Export only after an explicit user action; state which paths, hashes, and metadata are included; write only to the chosen filesystem destination; warn that sharing or choosing a synced, cloud-backed, or network destination can disclose the report through that provider |
+| Spreadsheet formula injection through CSV | Neutralize data cells whose first effective character could be evaluated as a formula, including after leading whitespace or control characters; cover hostile filenames and paths in tests |
+| Report saved over an unintended file | Make the selected format authoritative, resolve the final path and extension before authorization, prompt against that exact resolved path, and never infer overwrite authority from a different path shown earlier in the dialog |
+| Partial or stale report publication | Stream on a cancellable background worker to a short, same-directory staging file; sync, close, and atomically replace only after success; remove staging files after failure or cancellation |
 | Dependency/action compromise | Minimal dependencies, `go mod verify`, vulnerability review, full-SHA action pins, Dependabot, CodeQL, protected branches |
 | Release substitution | Clean exact-commit build, source/executable receipt, digest-pinned packaging, reproducible unsigned build, provenance, Authenticode signatures, SHA-256 checksums, protected tag release |
 
 ## Authorization model
 
-TwinTidy runs with the current user's permissions and requests no elevation. Selecting a folder authorizes read-only inspection within the validated scope. It does not authorize deletion. The current build has no enabled destructive action. A future recycle action requires a separate, explicit confirmation that identifies each target and retained copy.
+TwinTidy runs with the current user's permissions and requests no elevation. Selecting a folder authorizes read-only inspection within the validated scope. It does not authorize deletion or report export. Export requires a separate user action, format choice, and destination choice. Overwriting is authorized only for the exact resolved path after format and extension normalization. The current build has no enabled destructive action. A future recycle action requires a separate, explicit confirmation that identifies each target and retained copy.
 
 Confirmation is bound to expected file identities. A stale confirmation cannot be reused for a different filesystem object at the same path.
 
@@ -55,6 +61,7 @@ Confirmation is bound to expected file identities. A stale confirmation cannot b
 - No telemetry, analytics, update request, account, or cloud upload occurs by default.
 - Logs stay under `%LOCALAPPDATA%\TwinTidy\logs` unless the user deliberately shares them.
 - Diagnostics record operational state needed for support, not file contents.
+- Reports are written only to an explicitly chosen filesystem destination. TwinTidy has no report-upload client, but a user-selected synced, cloud-backed, or network destination may be transferred by its configured provider.
 - A future network feature requires explicit opt-in, a privacy update, threat-model revision, and ADR.
 
 ## Release security

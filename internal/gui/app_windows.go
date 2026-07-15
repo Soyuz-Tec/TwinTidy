@@ -195,7 +195,11 @@ func (a *windowsApp) handleWindowClosing(canceled *bool, _ walk.CloseReason) {
 	a.stopPreviewWorker()
 	if disposition == closeDeferred {
 		*canceled = true
-		_ = a.statusLabel.SetText("Finishing the active Recycle Bin operation before closing TwinTidy.")
+		if a.operation.phase == phaseClosingAfterExport {
+			_ = a.statusLabel.SetText("Cancelling report export and removing its staging file before closing TwinTidy.")
+		} else {
+			_ = a.statusLabel.SetText("Finishing the active Recycle Bin operation before closing TwinTidy.")
+		}
 		a.renderFromPhase()
 		generation := uint64(0)
 		if a.operation.active != nil {
@@ -413,14 +417,14 @@ func controlsForOperation(state *operationState, hasRows, hasDuplicates bool, ch
 	resultActions := state.phase == phaseResultsReady && hasDuplicates
 	scanText := "Surface Scan"
 	switch state.phase {
-	case phaseSurfaceReady, phaseDuplicateScanning, phaseDuplicateCancelling, phaseResultsReady, phaseDeleting, phaseClosingAfterDelete:
+	case phaseSurfaceReady, phaseDuplicateScanning, phaseDuplicateCancelling, phaseResultsReady, phaseExporting, phaseExportCancelling, phaseDeleting, phaseClosingAfterExport, phaseClosingAfterDelete:
 		scanText = "Find Duplicates"
 	}
 
 	return phaseControls{
 		selectFolder:   state.canChangeFolder(),
 		scan:           state.phase == phaseFolderReady || state.phase == phaseSurfaceReady,
-		cancel:         state.phase == phaseSurfaceScanning || state.phase == phaseDuplicateScanning,
+		cancel:         state.phase == phaseSurfaceScanning || state.phase == phaseDuplicateScanning || state.phase == phaseExporting,
 		clear:          reviewable && hasRows,
 		reset:          state.canReset(),
 		fileFocus:      reviewable,
@@ -894,6 +898,12 @@ func (a *windowsApp) surfaceFilesForSelectedCategories() []scanner.FileRecord {
 func (a *windowsApp) cancelScan() {
 	if a.operation.requestScanCancellation() {
 		_ = a.statusLabel.SetText("Cancelling scan. Waiting for active file work to stop.")
+		a.renderFromPhase()
+		return
+	}
+	if a.operation.requestExportCancellation() {
+		diagnostics.Logf("report export cancellation requested")
+		_ = a.statusLabel.SetText("Cancelling report export and removing its staging file.")
 		a.renderFromPhase()
 	}
 }

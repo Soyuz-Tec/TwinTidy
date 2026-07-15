@@ -33,7 +33,10 @@ func TestAppPhaseStringCoversEveryPhase(t *testing.T) {
 		phaseDuplicateScanning,
 		phaseDuplicateCancelling,
 		phaseResultsReady,
+		phaseExporting,
+		phaseExportCancelling,
 		phaseDeleting,
+		phaseClosingAfterExport,
 		phaseClosingAfterDelete,
 		phaseClosing,
 	}
@@ -60,6 +63,7 @@ func TestOperationKindStringCoversEveryKind(t *testing.T) {
 	}{
 		{operationSurfaceScan, "surface scan"},
 		{operationDuplicateScan, "duplicate scan"},
+		{operationExport, "report export"},
 		{operationDelete, "delete"},
 	}
 	for _, test := range tests {
@@ -139,7 +143,10 @@ func TestFolderAndResetPermissionsByPhase(t *testing.T) {
 		{phaseDuplicateScanning, false},
 		{phaseDuplicateCancelling, false},
 		{phaseResultsReady, true},
+		{phaseExporting, false},
+		{phaseExportCancelling, false},
 		{phaseDeleting, false},
+		{phaseClosingAfterExport, false},
 		{phaseClosingAfterDelete, false},
 		{phaseClosing, false},
 	}
@@ -463,6 +470,80 @@ func TestDeleteCompletionAndWrongGeneration(t *testing.T) {
 	}
 	if state.phase != phaseResultsReady || state.active != nil {
 		t.Fatalf("delete completion state = %+v", state)
+	}
+}
+
+func TestExportStartCancelAndCompletion(t *testing.T) {
+	state := stateWithResults(t)
+	cancelCalls := 0
+	token, err := state.beginExport(operationTestStart, func() { cancelCalls++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.phase != phaseExporting || !state.accepts(token) {
+		t.Fatalf("export token was not activated: %+v", state)
+	}
+	if !state.requestExportCancellation() || state.phase != phaseExportCancelling || cancelCalls != 1 {
+		t.Fatalf("export cancellation state=%+v calls=%d", state, cancelCalls)
+	}
+	if state.requestExportCancellation() || cancelCalls != 1 {
+		t.Fatalf("repeated cancellation changed state: %+v calls=%d", state, cancelCalls)
+	}
+
+	wrong := token
+	wrong.generation++
+	if accepted, shouldClose := state.completeExport(wrong); accepted || shouldClose {
+		t.Fatalf("stale completion returned accepted=%v close=%v", accepted, shouldClose)
+	}
+	if accepted, shouldClose := state.completeExport(token); !accepted || shouldClose {
+		t.Fatalf("matching completion returned accepted=%v close=%v", accepted, shouldClose)
+	}
+	if state.phase != phaseResultsReady || state.active != nil || state.cancel != nil {
+		t.Fatalf("completed export state = %+v", state)
+	}
+}
+
+func TestExportStartRequiresResults(t *testing.T) {
+	for _, phase := range []appPhase{phaseNoFolder, phaseFolderReady, phaseSurfaceReady, phaseDuplicateScanning, phaseExporting, phaseDeleting, phaseClosing} {
+		t.Run(phase.String(), func(t *testing.T) {
+			state := newOperationState()
+			state.phase = phase
+			_, err := state.beginExport(operationTestStart, nil)
+			if !errors.Is(err, errInvalidOperationTransition) {
+				t.Fatalf("error = %v, want transition error", err)
+			}
+		})
+	}
+}
+
+func TestCloseDuringExportCancelsAndDefersUntilCleanup(t *testing.T) {
+	state := stateWithResults(t)
+	cancelCalls := 0
+	token, err := state.beginExport(operationTestStart, func() { cancelCalls++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if disposition := state.requestClose(); disposition != closeDeferred {
+		t.Fatalf("requestClose() = %v, want %v", disposition, closeDeferred)
+	}
+	if state.phase != phaseClosingAfterExport || cancelCalls != 1 || !state.accepts(token) {
+		t.Fatalf("deferred export close state=%+v calls=%d", state, cancelCalls)
+	}
+	if disposition := state.requestClose(); disposition != closeDeferred || cancelCalls != 1 {
+		t.Fatalf("repeated close disposition=%v calls=%d", disposition, cancelCalls)
+	}
+
+	wrong := token
+	wrong.folderRevision++
+	if accepted, shouldClose := state.completeExport(wrong); accepted || shouldClose {
+		t.Fatal("stale export completion released deferred close")
+	}
+	if accepted, shouldClose := state.completeExport(token); !accepted || !shouldClose {
+		t.Fatalf("completion returned accepted=%v close=%v", accepted, shouldClose)
+	}
+	if state.phase != phaseClosing || !state.allowClose || state.active != nil {
+		t.Fatalf("completed deferred close state = %+v", state)
 	}
 }
 

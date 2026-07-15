@@ -1,8 +1,12 @@
 package report
 
 import (
+	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,6 +89,45 @@ func TestJSONDocumentRoundTrips(t *testing.T) {
 	}
 }
 
+func TestWriteStreamsJSON(t *testing.T) {
+	generatedAt := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	var buffer bytes.Buffer
+	summary, err := Write(
+		context.Background(),
+		&buffer,
+		FormatJSON,
+		`C:\scanned`,
+		sampleGroups(),
+		generatedAt,
+	)
+	if err != nil {
+		t.Fatalf("Write JSON failed: %v", err)
+	}
+	if summary.GroupCount != 2 || summary.FileCount != 5 || summary.ReclaimableBytes != 4196 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if summary.BytesWritten != int64(buffer.Len()) {
+		t.Fatalf("BytesWritten = %d, buffer length = %d", summary.BytesWritten, buffer.Len())
+	}
+	if !bytes.HasSuffix(buffer.Bytes(), []byte("\n")) {
+		t.Fatal("streamed JSON does not end with a newline")
+	}
+
+	var decoded Document
+	if err := json.Unmarshal(buffer.Bytes(), &decoded); err != nil {
+		t.Fatalf("streamed JSON did not parse: %v\n%s", err, buffer.String())
+	}
+	if decoded.Schema != Schema || decoded.GeneratedAt != "2026-07-15T12:00:00Z" {
+		t.Fatalf("decoded metadata mismatch: %#v", decoded)
+	}
+	if decoded.GroupCount != 2 || decoded.FileCount != 5 || decoded.ReclaimableBytes != 4196 {
+		t.Fatalf("decoded summary mismatch: %#v", decoded)
+	}
+	if decoded.Groups[0].Files[0].Path != `C:\docs\report.pdf` {
+		t.Fatalf("decoded path mismatch: %q", decoded.Groups[0].Files[0].Path)
+	}
+}
+
 func TestCSVGuardsFormulaInjection(t *testing.T) {
 	document := BuildDocument(`C:\scanned`, sampleGroups(), time.Now())
 	data, err := document.MarshalCSV()
@@ -118,6 +161,83 @@ func TestCSVGuardsFormulaInjection(t *testing.T) {
 	}
 }
 
+func TestWriteStreamsCSV(t *testing.T) {
+	generatedAt := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	var buffer bytes.Buffer
+	summary, err := Write(
+		context.Background(),
+		&buffer,
+		FormatCSV,
+		`C:\scanned`,
+		sampleGroups(),
+		generatedAt,
+	)
+	if err != nil {
+		t.Fatalf("Write CSV failed: %v", err)
+	}
+	if summary.GroupCount != 2 || summary.FileCount != 5 || summary.ReclaimableBytes != 4196 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	if summary.BytesWritten != int64(buffer.Len()) {
+		t.Fatalf("BytesWritten = %d, buffer length = %d", summary.BytesWritten, buffer.Len())
+	}
+
+	records, err := csv.NewReader(bytes.NewReader(buffer.Bytes())).ReadAll()
+	if err != nil {
+		t.Fatalf("streamed CSV did not parse: %v", err)
+	}
+	if len(records) != 6 {
+		t.Fatalf("expected header plus 5 rows, got %d", len(records))
+	}
+	if records[1][5] != "4096" || records[1][6] != "4196" {
+		t.Fatalf("first group/report estimates = %q/%q", records[1][5], records[1][6])
+	}
+	if records[4][7] != `'=SUM(A1:A9).txt` {
+		t.Fatalf("formula-leading path = %q", records[4][7])
+	}
+}
+
+func TestWriteHonorsCancellationBeforeOutput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var buffer bytes.Buffer
+	summary, err := Write(ctx, &buffer, FormatJSON, "", sampleGroups(), time.Now())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Write error = %v, want context.Canceled", err)
+	}
+	if summary.BytesWritten != 0 || buffer.Len() != 0 {
+		t.Fatalf("canceled write emitted data: summary=%#v length=%d", summary, buffer.Len())
+	}
+}
+
+func TestWritePropagatesDestinationFailure(t *testing.T) {
+	wantErr := errors.New("destination failed")
+	writer := &failingWriter{remaining: 32, err: wantErr}
+	summary, err := Write(
+		context.Background(),
+		writer,
+		FormatJSON,
+		`C:\scanned`,
+		sampleGroups(),
+		time.Now(),
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Write error = %v, want %v", err, wantErr)
+	}
+	if summary.BytesWritten != 32 {
+		t.Fatalf("BytesWritten = %d, want 32", summary.BytesWritten)
+	}
+}
+
+func TestFormatExtension(t *testing.T) {
+	if FormatCSV.Extension() != ".csv" || FormatJSON.Extension() != ".json" {
+		t.Fatalf("extensions = %q and %q", FormatCSV.Extension(), FormatJSON.Extension())
+	}
+	if Format("xml").Extension() != "" {
+		t.Fatalf("unsupported format extension = %q", Format("xml").Extension())
+	}
+}
+
 func TestGuardSpreadsheetFormula(t *testing.T) {
 	cases := map[string]string{
 		"":                 "",
@@ -143,11 +263,25 @@ func TestGuardSpreadsheetFormula(t *testing.T) {
 func TestWriteFileAtomicCreatesAndReplacesReport(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "report.csv")
-	if err := WriteFileAtomic(path, []byte("first\r\n")); err != nil {
+	bytesWritten, err := WriteFileAtomic(context.Background(), path, func(writer io.Writer) error {
+		_, err := io.WriteString(writer, "first\r\n")
+		return err
+	})
+	if err != nil {
 		t.Fatalf("first WriteFileAtomic failed: %v", err)
 	}
-	if err := WriteFileAtomic(path, []byte("second\r\n")); err != nil {
+	if bytesWritten != 7 {
+		t.Fatalf("first bytes written = %d, want 7", bytesWritten)
+	}
+	bytesWritten, err = WriteFileAtomic(context.Background(), path, func(writer io.Writer) error {
+		_, err := io.WriteString(writer, "second\r\n")
+		return err
+	})
+	if err != nil {
 		t.Fatalf("replacement WriteFileAtomic failed: %v", err)
+	}
+	if bytesWritten != 8 {
+		t.Fatalf("replacement bytes written = %d, want 8", bytesWritten)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -165,8 +299,118 @@ func TestWriteFileAtomicCreatesAndReplacesReport(t *testing.T) {
 	}
 }
 
+func TestWriteFileAtomicCallbackFailurePreservesTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.json")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatalf("WriteFile setup failed: %v", err)
+	}
+	wantErr := errors.New("serialization failed")
+	bytesWritten, err := WriteFileAtomic(context.Background(), path, func(writer io.Writer) error {
+		if _, err := io.WriteString(writer, "partial"); err != nil {
+			return err
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("WriteFileAtomic error = %v, want %v", err, wantErr)
+	}
+	if bytesWritten != 7 {
+		t.Fatalf("bytes written = %d, want 7", bytesWritten)
+	}
+	assertFileContents(t, path, "original")
+	assertDirectoryNames(t, dir, "report.json")
+}
+
+func TestWriteFileAtomicCancellationPreservesTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.json")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatalf("WriteFile setup failed: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	bytesWritten, err := WriteFileAtomic(ctx, path, func(writer io.Writer) error {
+		if _, err := io.WriteString(writer, "partial"); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteFileAtomic error = %v, want context.Canceled", err)
+	}
+	if bytesWritten != 7 {
+		t.Fatalf("bytes written = %d, want 7", bytesWritten)
+	}
+	assertFileContents(t, path, "original")
+	assertDirectoryNames(t, dir, "report.json")
+}
+
+func TestWriteFileAtomicSupportsNearMaximumBasename(t *testing.T) {
+	dir := t.TempDir()
+	// The destination component is 250 characters. A staging pattern derived
+	// from this basename would exceed the common 255-character component
+	// limit, while the fixed short staging prefix remains safe.
+	name := strings.Repeat("r", 246) + ".csv"
+	path := filepath.Join(dir, name)
+	_, err := WriteFileAtomic(context.Background(), path, func(writer io.Writer) error {
+		_, err := io.WriteString(writer, "report\r\n")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("WriteFileAtomic with %d-character basename failed: %v", len(name), err)
+	}
+	assertFileContents(t, path, "report\r\n")
+	assertDirectoryNames(t, dir, name)
+}
+
 func TestWriteFileAtomicRejectsEmptyPath(t *testing.T) {
-	if err := WriteFileAtomic("", []byte("report")); err == nil {
+	if _, err := WriteFileAtomic(context.Background(), "", func(io.Writer) error { return nil }); err == nil {
 		t.Fatal("empty report path was accepted")
+	}
+}
+
+type failingWriter struct {
+	remaining int
+	err       error
+}
+
+func (w *failingWriter) Write(data []byte) (int, error) {
+	if w.remaining == 0 {
+		return 0, w.err
+	}
+	if len(data) <= w.remaining {
+		w.remaining -= len(data)
+		return len(data), nil
+	}
+	n := w.remaining
+	w.remaining = 0
+	return n, w.err
+}
+
+func assertFileContents(t *testing.T, path, expected string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) failed: %v", path, err)
+	}
+	if string(data) != expected {
+		t.Fatalf("contents of %q = %q, want %q", path, data, expected)
+	}
+}
+
+func assertDirectoryNames(t *testing.T, dir string, expected ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q) failed: %v", dir, err)
+	}
+	if len(entries) != len(expected) {
+		t.Fatalf("directory %q has %d entries, want %d: %#v", dir, len(entries), len(expected), entries)
+	}
+	for index, name := range expected {
+		if entries[index].Name() != name {
+			t.Fatalf("directory entry %d = %q, want %q", index, entries[index].Name(), name)
+		}
 	}
 }
