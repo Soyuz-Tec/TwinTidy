@@ -40,6 +40,9 @@ func run(args []string, stdout io.Writer, stderr io.Writer) (exitCode int) {
 		}
 	}()
 
+	if len(args) > 0 && args[0] == "scan" {
+		return runScan(args[1:], stdout, stderr)
+	}
 	if len(args) == 1 {
 		switch args[0] {
 		case "--help", "-h":
@@ -86,6 +89,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  TwinTidy.exe                 Launch the desktop application")
+	fmt.Fprintln(output, "  TwinTidy.exe scan <folder>   Find duplicates headlessly (see scan -h)")
 	fmt.Fprintln(output, "  TwinTidy.exe --version       Print build identity")
 	fmt.Fprintln(output, "  TwinTidy.exe --ui-smoke-test Create and dispose the main window")
 	fmt.Fprintln(output, "  TwinTidy.exe --help          Show this help")
