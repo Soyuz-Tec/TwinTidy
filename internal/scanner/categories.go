@@ -43,6 +43,7 @@ func DefaultScanOptions() ScanOptions {
 
 func NormalizeScanOptions(options ScanOptions) ScanOptions {
 	options.UserFilesOnly = true
+	options = normalizeFilterOptions(options)
 	if len(options.Categories) == 0 {
 		options.Categories = AllFileCategories()
 		return options

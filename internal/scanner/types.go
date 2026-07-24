@@ -81,6 +81,20 @@ type Progress struct {
 type ScanOptions struct {
 	Categories    map[FileCategory]bool
 	UserFilesOnly bool
+
+	// MinFileSize excludes files smaller than this many bytes from duplicate
+	// matching. Zero applies no floor. Negative values normalize to zero.
+	MinFileSize int64
+
+	// ExcludedPaths removes files at or below any listed path from duplicate
+	// matching. Entries are absolute-cleaned during normalization and matched
+	// case-insensitively on whole path-segment boundaries, so an entry never
+	// accidentally excludes a sibling directory that shares a name prefix.
+	ExcludedPaths []string
+
+	// ExcludedExtensions removes files whose extension matches an entry.
+	// Entries normalize to lower case with a leading dot.
+	ExcludedExtensions []string
 }
 
 // ScanLimits cap the in-memory inventory built during one scan. Zero values
