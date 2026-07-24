@@ -967,6 +967,9 @@ func filterRecordsByOptions(files []FileRecord, options ScanOptions) []FileRecor
 		if !options.Categories[category] {
 			continue
 		}
+		if !recordPassesFilters(file, options) {
+			continue
+		}
 		filtered = append(filtered, file)
 	}
 	return filtered
