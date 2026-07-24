@@ -20,6 +20,7 @@ ADRs record material decisions that should not be rediscovered from code or chat
 | [0005](0005-disable-path-based-recycle.md) | Accepted | Disable path-based Windows recycling until the destructive sink is identity-bound |
 | [0006](0006-per-user-msix-distribution.md) | Accepted | Ship a protected, signed, per-user MSIX for x64 and ARM64 alongside portable packages |
 | [0007](0007-streamed-report-export.md) | Accepted | Stream report exports through a cancellable, generation-scoped atomic writer |
+| [0009](0009-hardlink-consolidation.md) | Proposed | Identity-verified hardlink consolidation as a zero-data-loss space reclaim (0008 reserved by the recycle-verification spike branch) |
 
 ## Creating an ADR
 
