@@ -425,7 +425,7 @@ func controlsForOperation(state *operationState, hasRows, hasDuplicates bool, ch
 
 	return phaseControls{
 		selectFolder:   state.canChangeFolder(),
-		scan:           state.phase == phaseFolderReady || state.phase == phaseSurfaceReady,
+		scan:           state.phase == phaseFolderReady || state.phase == phaseSurfaceReady || state.phase == phaseResultsReady,
 		cancel:         state.phase == phaseSurfaceScanning || state.phase == phaseDuplicateScanning || state.phase == phaseExporting,
 		clear:          reviewable && hasRows,
 		reset:          state.canReset(),
@@ -869,8 +869,8 @@ func (a *windowsApp) scanFinished(token operationToken, groups []scanner.Duplica
 	_ = a.stageLabel.SetText(string(scanner.StageDone))
 	_ = a.elapsedLabel.SetText(formatDuration(time.Since(token.startedAt)))
 	if len(groups) == 0 {
-		_ = a.statusLabel.SetText(fmt.Sprintf("No exact duplicates found. Showing %d scanned file(s) from the selected focus categories.", len(a.model.rows)))
-		a.setPreviewMessage("No exact duplicates were found. The table remains populated for review, preview, and opening file locations.")
+		_ = a.statusLabel.SetText(fmt.Sprintf("No exact duplicates found in the selected focus categories. Adjust the file-type focus and run Find Duplicates again, or review the %d scanned file(s).", len(a.model.rows)))
+		a.setPreviewMessage("No exact duplicates were found in the selected file-type focus. Change the focus checkboxes and run Find Duplicates again without rescanning the folder.")
 	} else {
 		_ = a.statusLabel.SetText(fmt.Sprintf("Found %d exact duplicate group(s), containing %d duplicate file record(s).", len(groups), len(a.model.rows)))
 		a.setPreviewMessage("Select a row to inspect file details, exact hash, and a visual preview for supported file types.")

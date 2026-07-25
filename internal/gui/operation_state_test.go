@@ -307,7 +307,6 @@ func TestScanStartsRejectInvalidPhasesAndExistingWork(t *testing.T) {
 		phaseNoFolder,
 		phaseFolderReady,
 		phaseSurfaceScanning,
-		phaseResultsReady,
 		phaseDeleting,
 		phaseClosing,
 	} {
@@ -319,6 +318,28 @@ func TestScanStartsRejectInvalidPhasesAndExistingWork(t *testing.T) {
 				t.Fatalf("error = %v, want transition error", err)
 			}
 		})
+	}
+}
+
+// A published result — including "no duplicates found" — must not trap the
+// user: adjusting the file-type focus and rerunning duplicate matching is a
+// valid transition that replaces the previous results.
+func TestDuplicateScanRestartsFromPublishedResults(t *testing.T) {
+	state := newOperationState()
+	state.phase = phaseResultsReady
+
+	token, err := state.beginDuplicateScan(operationTestStart, nil)
+	if err != nil {
+		t.Fatalf("beginDuplicateScan from results returned error: %v", err)
+	}
+	if state.phase != phaseDuplicateScanning {
+		t.Fatalf("phase = %s, want %s", state.phase, phaseDuplicateScanning)
+	}
+	if !state.completeDuplicateScan(token, true) {
+		t.Fatal("completeDuplicateScan rejected matching token")
+	}
+	if state.phase != phaseResultsReady {
+		t.Fatalf("phase after completion = %s, want %s", state.phase, phaseResultsReady)
 	}
 }
 

@@ -201,8 +201,12 @@ func (state *operationState) completeSurfaceScan(token operationToken, successfu
 	return true
 }
 
+// beginDuplicateScan starts duplicate matching over the current surface
+// snapshot. It is also valid from published results: the user may adjust the
+// file-type focus after reviewing an outcome — especially an empty one — and
+// run the matcher again, which replaces the previous results.
 func (state *operationState) beginDuplicateScan(startedAt time.Time, cancel context.CancelFunc) (operationToken, error) {
-	if state.phase != phaseSurfaceReady {
+	if state.phase != phaseSurfaceReady && state.phase != phaseResultsReady {
 		return operationToken{}, state.transitionError("start duplicate scan")
 	}
 	return state.beginOperation(operationDuplicateScan, phaseDuplicateScanning, startedAt, cancel), nil
