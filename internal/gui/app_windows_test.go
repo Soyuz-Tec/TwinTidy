@@ -122,6 +122,7 @@ func TestControlsForOperationPhase(t *testing.T) {
 			phase: phaseResultsReady,
 			want: phaseControls{
 				selectFolder:   true,
+				scan:           true,
 				clear:          true,
 				reset:          true,
 				fileFocus:      true,
