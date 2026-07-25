@@ -143,7 +143,7 @@ func TestCSVGuardsFormulaInjection(t *testing.T) {
 	if len(records) != 1+5 {
 		t.Fatalf("expected header plus 5 rows, got %d records", len(records))
 	}
-	wantHeader := "generatedAt,scanFolder,group,sha256,groupSize,groupReclaimableBytes,reportReclaimableBytes,path,fileSize,createdAt,modifiedAt,category"
+	wantHeader := "generatedAt,scanFolder,group,sha256,groupSize,groupReclaimableBytes,reportReclaimableBytes,path,fileSize,createdAt,modifiedAt,category,root"
 	if strings.Join(records[0], ",") != wantHeader {
 		t.Fatalf("header = %q", strings.Join(records[0], ","))
 	}

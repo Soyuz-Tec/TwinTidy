@@ -65,6 +65,11 @@ type File struct {
 	CreatedAt  string `json:"createdAt,omitempty"`
 	ModifiedAt string `json:"modifiedAt,omitempty"`
 	Category   string `json:"category,omitempty"`
+
+	// Root is the authorized scan root that discovered this file. In a
+	// multi-folder scan it lets a reader reconcile which side of a
+	// cross-root duplicate group each member came from.
+	Root string `json:"root,omitempty"`
 }
 
 // Group is one verified duplicate group: files whose complete SHA-256
@@ -287,6 +292,7 @@ var csvHeader = []string{
 	"createdAt",
 	"modifiedAt",
 	"category",
+	"root",
 }
 
 func summarize(ctx context.Context, groups []scanner.DuplicateGroup) (Summary, error) {
@@ -386,6 +392,7 @@ func csvRow(
 		guardSpreadsheetFormula(file.CreatedAt),
 		guardSpreadsheetFormula(file.ModifiedAt),
 		guardSpreadsheetFormula(file.Category),
+		guardSpreadsheetFormula(file.Root),
 	}
 }
 
@@ -530,6 +537,7 @@ func fileFromRecord(file scanner.FileRecord) File {
 		CreatedAt:  formatTimestamp(file.CreatedAt),
 		ModifiedAt: formatTimestamp(file.ModifiedAt),
 		Category:   string(file.Category),
+		Root:       file.Scope.RootFinalPath,
 	}
 }
 
