@@ -50,7 +50,7 @@ func TestPathWithinFold(t *testing.T) {
 	t.Parallel()
 
 	sep := string(filepath.Separator)
-	root := filepath.Join("C:", "Data")
+	root := filepath.Join("C:\\", "Data")
 	cases := []struct {
 		name   string
 		path   string
@@ -61,7 +61,7 @@ func TestPathWithinFold(t *testing.T) {
 		{"child file", filepath.Join(root, "a.txt"), root, true},
 		{"nested child", filepath.Join(root, "sub", "b.txt"), root, true},
 		{"case-insensitive", strings.ToUpper(root) + sep + "c.txt", root, true},
-		{"sibling name prefix", filepath.Join("C:", "Database", "d.txt"), root, false},
+		{"sibling name prefix", filepath.Join("C:\\", "Database", "d.txt"), root, false},
 		{"unrelated", filepath.Join("D:", "Other", "e.txt"), root, false},
 		{"empty prefix", filepath.Join(root, "f.txt"), "", false},
 		{"path shorter than prefix", "C:" + sep, root, false},
@@ -81,7 +81,7 @@ func TestPathWithinFold(t *testing.T) {
 func TestRecordPassesFilters(t *testing.T) {
 	t.Parallel()
 
-	base := filepath.Join("C:", "Users", "example", "Documents")
+	base := filepath.Join("C:\\", "Users", "example", "Documents")
 	record := func(path string, size int64) FileRecord {
 		return FileRecord{Path: path, Size: size}
 	}
@@ -150,7 +150,7 @@ func TestRecordPassesFilters(t *testing.T) {
 func TestFilterRecordsByOptionsAppliesUserFilters(t *testing.T) {
 	t.Parallel()
 
-	base := filepath.Join("C:", "Users", "example", "Documents")
+	base := filepath.Join("C:\\", "Users", "example", "Documents")
 	files := []FileRecord{
 		{Path: filepath.Join(base, "keep.txt"), Size: 4096, Category: CategoryText},
 		{Path: filepath.Join(base, "small.txt"), Size: 10, Category: CategoryText},
