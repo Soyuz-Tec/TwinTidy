@@ -74,6 +74,7 @@ type windowsApp struct {
 	exportButton        *walk.PushButton
 	openButton          *walk.PushButton
 	previewSafetyButton *walk.PushButton
+	consolidateButton   *walk.PushButton
 	deleteButton        *walk.PushButton
 
 	folderLabel  *walk.Label
@@ -306,6 +307,7 @@ func (a *windowsApp) create() error {
 					PushButton{AssignTo: &a.openButton, Text: "Show In Explorer", Font: macControlFont(), OnClicked: a.showSelectedInExplorer},
 					PushButton{AssignTo: &a.previewSafetyButton, Text: "Preview Safety", Font: macControlFont(), OnClicked: a.showPreviewSafety},
 					HSpacer{},
+					PushButton{AssignTo: &a.consolidateButton, Text: "Consolidate Checked", Font: macControlFont(), OnClicked: a.confirmConsolidateSelected},
 					PushButton{AssignTo: &a.deleteButton, Text: "Recycle Checked", Font: macControlFont(), Background: SolidColorBrush{Color: macDangerRed}, OnClicked: a.confirmDeleteSelected},
 				},
 			},
@@ -452,6 +454,7 @@ func (a *windowsApp) renderFromPhase() {
 	a.keepOldestButton.SetEnabled(controls.resultActions)
 	a.clearSelectButton.SetEnabled(controls.resultActions)
 	a.exportButton.SetEnabled(controls.resultActions)
+	a.consolidateButton.SetEnabled(controls.deleteSelected && scanner.HardlinkConsolidationSupported())
 	a.deleteButton.SetEnabled(controls.deleteSelected && scanner.RecycleSupported())
 
 	currentIndex := a.table.CurrentIndex()
@@ -1419,6 +1422,9 @@ func (a *windowsApp) updateDeleteActionState() {
 	}
 	controls := controlsForOperation(&a.operation, len(a.model.rows) > 0, rowsContainDuplicates(a.model.rows), a.model.selectedCount())
 	a.deleteButton.SetEnabled(controls.deleteSelected && scanner.RecycleSupported())
+	if a.consolidateButton != nil {
+		a.consolidateButton.SetEnabled(controls.deleteSelected && scanner.HardlinkConsolidationSupported())
+	}
 }
 
 func (a *windowsApp) publishRows() {
