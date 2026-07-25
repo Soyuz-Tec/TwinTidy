@@ -1612,28 +1612,62 @@ func (m *duplicateTableModel) notifySelectionChanged() {
 	}
 }
 
+// selectAllExcept marks every duplicate except one keeper per group.
+//
+// The choice is delegated to scanner.ApplySelectionPolicy rather than
+// reimplemented here: that engine enforces the keep-one-copy invariant on
+// re-derived membership and is fuzz-verified, so routing the UI through it
+// keeps a single tested definition of which file survives. A policy error
+// leaves the existing selection untouched instead of applying a partial one.
 func (m *duplicateTableModel) selectAllExcept(keepNewest bool) {
-	keepers := make(map[string]int)
-	for i, row := range m.rows {
+	strategy := scanner.KeepNewest
+	if !keepNewest {
+		strategy = scanner.KeepOldest
+	}
+	m.applySelectionPolicy(scanner.SelectionPolicy{Strategy: strategy})
+}
+
+// applySelectionPolicy runs one keep-rule over the current rows. Rows are
+// grouped by their scan key, so a group is exactly what the user sees.
+func (m *duplicateTableModel) applySelectionPolicy(policy scanner.SelectionPolicy) {
+	groups := make([]scanner.DuplicateGroup, 0)
+	order := make([]string, 0)
+	byKey := make(map[string][]scanner.FileRecord)
+	hashByKey := make(map[string]string)
+	for _, row := range m.rows {
 		if !row.Duplicate {
 			continue
 		}
-		current, ok := keepers[row.Key]
-		if !ok {
-			keepers[row.Key] = i
-			continue
+		if _, seen := byKey[row.Key]; !seen {
+			order = append(order, row.Key)
+			hashByKey[row.Key] = row.Hash
 		}
-		if keepNewest {
-			if row.File.ModifiedAt.After(m.rows[current].File.ModifiedAt) {
-				keepers[row.Key] = i
-			}
-		} else if row.File.ModifiedAt.Before(m.rows[current].File.ModifiedAt) {
-			keepers[row.Key] = i
-		}
+		byKey[row.Key] = append(byKey[row.Key], row.File)
+	}
+	for _, key := range order {
+		files := byKey[key]
+		groups = append(groups, scanner.DuplicateGroup{
+			Size:  files[0].Size,
+			Hash:  hashByKey[key],
+			Files: files,
+		})
 	}
 
+	selections, err := scanner.ApplySelectionPolicy(groups, policy)
+	if err != nil {
+		diagnostics.Logf("selection policy rejected: error_type=%T", err)
+		return
+	}
+
+	marked := make(map[string]struct{})
+	for _, selection := range selections {
+		for _, file := range selection.Marked {
+			marked[strings.ToLower(filepath.Clean(file.Path))] = struct{}{}
+		}
+	}
 	for i := range m.rows {
-		m.rows[i].Selected = m.rows[i].Duplicate && keepers[m.rows[i].Key] != i
+		_, selected := marked[strings.ToLower(filepath.Clean(m.rows[i].File.Path))]
+		m.rows[i].Selected = m.rows[i].Duplicate && selected
 	}
 }
 
