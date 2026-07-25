@@ -633,9 +633,16 @@ jobs:
             "- Durable identity EKU: ``$($manifest.publisher.durableIdentityEku)``",
             ""
           ) -join "`n"
+          $attribution = @(
+            "",
+            "---",
+            "",
+            "TwinTidy uses free code signing provided by [SignPath.io](https://signpath.io), with a certificate issued by the [SignPath Foundation](https://signpath.org). Signing is governed by the [code signing policy](https://github.com/$env:GITHUB_REPOSITORY/blob/main/docs/CODE_SIGNING_POLICY.md).",
+            ""
+          ) -join "`n"
           [System.IO.File]::WriteAllText(
             $notes,
-            ($identity + [System.IO.File]::ReadAllText($sourceNotes)),
+            ($identity + [System.IO.File]::ReadAllText($sourceNotes) + $attribution),
             [System.Text.UTF8Encoding]::new($false)
           )
           $arguments = @(
