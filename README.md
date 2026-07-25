@@ -123,6 +123,12 @@ Build exact-commit portable packages and run the source, receipt, reproducibilit
 
 Direct development builds remain available from a dirty working tree and are labeled with their source digest. Official public artifacts require the signing, native x64/ARM64 smoke, MSIX lifecycle, checksum, receipt, and provenance gates described in [Release engineering](docs/RELEASE.md). An unsigned local build is a development artifact, not an official TwinTidy release.
 
+## Code signing
+
+TwinTidy uses free code signing provided by [SignPath.io](https://signpath.io), with a certificate issued by the [SignPath Foundation](https://signpath.org). Signing is governed by the [code signing policy](docs/CODE_SIGNING_POLICY.md), which names who may authorize a release and requires per-release approval.
+
+Preview releases published before that certificate is in place are **unsigned** and are labeled as such on the [releases page](https://github.com/Soyuz-Tec/twintidy/releases). Verify any download against the SHA-256 checksums and build receipt published alongside it.
+
 ## Development status
 
 TwinTidy is being hardened toward its first reviewed release. The current pre-release build supports scanning, exact-match verification, selection planning, and previews; cleanup is disabled and no stable release may enable it without the identity-safety evidence required by ADR 0005.
