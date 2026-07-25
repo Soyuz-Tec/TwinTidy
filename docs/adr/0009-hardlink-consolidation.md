@@ -1,7 +1,7 @@
 # ADR 0009: Identity-verified hardlink consolidation
 
-- Status: Proposed
-- Date: 2026-07-24
+- Status: Accepted
+- Date: 2026-07-24 (proposed and accepted by the product owner the same day)
 
 Number 0008 is reserved by the identity-bound recycle verification spike on
 its in-review branch; this ADR is independent of that work but reuses its
@@ -87,10 +87,22 @@ bytes.
 - A future recycle implementation must account for consolidated files: the
   `linkCount > 1` exclusion currently guarantees they are never candidates.
 
-### Follow-up required before acceptance
+### Acceptance record
 
-- Product-owner decision on shipping order relative to ADR 0005.
-- Security review of the replacement sequence against the ADR 0002 threat
-  model, including the temporary-link window.
-- Confirmation that `ReplaceFileW` preserves the required ACL and attribute
-  behavior for the replaced path, or a documented alternative.
+- The product owner accepted this ADR on 2026-07-24 and authorized
+  implementation ahead of any ADR 0005 supersession: hardlink consolidation
+  may ship while recycling remains disabled, because no content ever becomes
+  unreachable.
+- The implementation replaces the `ReplaceFileW` sketch with a sequence that
+  is identity-bound at every destructive step, eliminating the
+  path-race window that motivated the ACL follow-up: the candidate is opened
+  with delete access and its verified handle performs the rename-away
+  (`FileRenameInfo`) and final disposal (`FileDispositionInfo`); the original
+  path is then relinked to the keeper and re-verified against the keeper's
+  identity before the backup is disposed. A failure at any step leaves the
+  content reachable (at the original path or the backup path) and reports the
+  backup location instead of guessing.
+- The adversarial fixtures listed in the Decision section gate the
+  implementation change; the cross-volume rejection fixture runs where a
+  second volume is available and the remaining fixtures run in the standard
+  suite.

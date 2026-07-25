@@ -278,13 +278,22 @@ func openVerificationSnapshotInScope(record FileRecord, shareDelete bool) (*os.F
 // before policy classifies post-scan metadata changes such as new hard links or
 // alternate streams. Callers must compare the returned snapshot with record.
 func openScopedVerificationSnapshot(record FileRecord, shareDelete bool) (*os.File, fileSnapshot, error) {
+	return openScopedSnapshotWith(record, func(path string) (*os.File, error) {
+		return openVerificationFile(path, shareDelete)
+	})
+}
+
+// openScopedSnapshotWith runs the scoped verification chain with a caller
+// supplied handle opener, so hardlink consolidation can bind a delete-capable
+// handle through the identical scope, reparse, and snapshot validation path.
+func openScopedSnapshotWith(record FileRecord, open func(string) (*os.File, error)) (*os.File, fileSnapshot, error) {
 	if err := validateAuthorizedScope(record.Scope); err != nil {
 		return nil, fileSnapshot{}, err
 	}
 	if err := validateNoTraversalReparseComponents(record.Path); err != nil {
 		return nil, fileSnapshot{}, err
 	}
-	file, err := openVerificationFile(record.Path, shareDelete)
+	file, err := open(record.Path)
 	if err != nil {
 		return nil, fileSnapshot{}, err
 	}
